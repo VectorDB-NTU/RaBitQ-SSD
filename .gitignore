@@ -1,0 +1,11 @@
+# Standalone build tree(s) and the binaries CMakeLists.txt writes to bin/.
+/build*/
+/bin/
+
+# Outputs of the documented workflow. docs/getting_started.md points DATA_ROOT
+# and INDEX_ROOT at $PWD/data and $PWD/indexes, and the search stage writes
+# results/; each can be many GB. No trailing slash: any of them may be a
+# symlink to a bigger device, and "dir/" would match only a real directory.
+/data
+/indexes
+/results
