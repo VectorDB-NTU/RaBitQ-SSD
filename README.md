@@ -2,12 +2,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-Code for the paper **RaBitQ-SSD: Split Codes and Pipelined I/O for
-SSD-Resident Vector Search**. See also the
-[technical report](technical_report.pdf).
-
-Billion-scale approximate nearest-neighbour search over vectors that do not fit
-in memory.
+Code for the paper **RaBitQ-SSD: Split Codes and Pipelined I/O for SSD-Resident Vector Search** ([arXiv](https://arxiv.org/pdf/2610.02652) and [technical report](technical_report.pdf)).
 
 RaBitQ-SSD extends IVF-RaBitQ to a DRAM–SSD hierarchy. Split-RaBitQ keeps a
 configurable prefix of each 1-bit code in DRAM to estimate distances and prune
@@ -46,10 +41,10 @@ otherwise. The current kernels require Linux and an x86-64 CPU with AVX2 or
 AVX-512. The build uses `-march=native`, so compile on the machine where the
 binaries will run.
 
-Binaries land in `bin/`: `build_invlist`, `build_coarse`, `querying`. Each
+Binaries are stored in `bin/`: `build_invlist`, `build_coarse`, `querying`. Each
 prints its arguments when run with none.
 
-The clustering, ground-truth **and index-build** stages each run a Python script
+The clustering, ground-truth and index-build stages each run a Python script
 that imports `faiss` and `numpy`. If `python3` is not an interpreter that has
 them, set `PYTHON_ENV=/path/to/that/python` on every one of those stages — the
 build stage included, where the failure otherwise surfaces only as
@@ -91,7 +86,7 @@ elsewhere.
 
 ## Parameters
 
-Nothing is configured per dataset. A `.fbin` begins with `[int32 n][int32 d]`,
+The configurations apply to all datasets. A `.fbin` begins with `[int32 n][int32 d]`,
 so every stage reads those two numbers off the data and derives the rest the
 same way — which is why the clustering, the index and the search agree without
 a config file:
@@ -162,8 +157,22 @@ docs/                     getting_started.md, cli_reference.md
 
 `rabitqlib/` is a vendored copy of the RaBitQ-Library headers extended
 with this project's SSD index, coarse quantizer and streaming build. The
-library's other index types come along unused; being header-only templates,
-they cost nothing.
+library's other index types come along unused; being header-only templates.
+
+## Citation
+
+If you use RaBitQ-SSD in your research, please cite our paper:
+
+```bibtex
+@misc{xu2026rabitqssd,
+  title         = {RaBitQ-SSD: Split Codes and Pipelined I/O for SSD-Resident Vector Search},
+  author        = {Yuexuan Xu, Jianyang Gao, Michael Norris, Alibek Zhakubayev, Pankaj Singh, Junjie Qi, Matthijs Douze, and Cheng Long},
+  year          = {2026},
+  eprint        = {2610.02652},
+  archivePrefix = {arXiv},
+  url           = {https://arxiv.org/abs/2610.02652}
+}
+```
 
 ## License
 
