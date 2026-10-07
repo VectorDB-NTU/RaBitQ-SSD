@@ -1,6 +1,8 @@
-# Standalone build tree(s) and the binaries CMakeLists.txt writes to bin/.
+# Standalone build tree(s) and the binaries CMakeLists.txt writes to bin/, or
+# to bin64/ in the build with 64-bit point ids.
 /build*/
 /bin/
+/bin64/
 
 # Outputs of the documented workflow. docs/getting_started.md points DATA_ROOT
 # and INDEX_ROOT at $PWD/data and $PWD/indexes, and the search stage writes

@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.10)
+cmake_minimum_required(VERSION 3.13)
 
 # RaBitQ-SSD — self-contained build of the command-line drivers in apps/.
 #
@@ -10,7 +10,9 @@ cmake_minimum_required(VERSION 3.10)
 #   * drain-phase pruning: cluster search runs at alpha=1.0 (baseline distk);
 #     only the post-nprobe drain phase prunes pending SSD pages against the
 #     drain_alpha-quantile distance (querying arg drain_alpha=, main config 0.4)
-#   * L2 + IP metrics, memory-budgeted (streaming) build.
+#   * L2 + IP metrics, memory-budgeted (streaming) build, float32 or uint8
+#     input; the SSD records hold ex-codes or, with store=raw, the vectors
+#     themselves for an exact re-rank.
 #
 # Three executables (binaries land in ./bin/):
 #   build_invlist   builds the base index + SSD index
@@ -23,6 +25,13 @@ cmake_minimum_required(VERSION 3.10)
 #
 #   cmake -S . -B build
 #   cmake --build build -j
+#
+# Point ids are 32-bit. For more than 2^32 - 1 points (DINO-10B), configure a
+# second build with 64-bit point ids; its binaries land in ./bin64/ and each
+# build reads only the indexes it wrote:
+#
+#   cmake -S . -B build64 -DRABITQ_PID64=ON
+#   cmake --build build64 -j
 
 project(RabitqSSD LANGUAGES CXX)
 
@@ -76,7 +85,13 @@ target_link_libraries(rabitq_io INTERFACE ${RABITQ_LIBAIO_LIBRARY})
 # includes resolve from here.
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin)
+option(RABITQ_PID64 "64-bit point ids, for more than 2^32 - 1 points" OFF)
+if(RABITQ_PID64)
+    message(STATUS "Point ids: 64-bit (binaries in bin64/)")
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin64)
+else()
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin)
+endif()
 
 # Shared translation units linked into every executable.
 set(RABITQ_CORE_SRC      ${CMAKE_CURRENT_SOURCE_DIR}/src/ivf_ssd_boundary_qd_ms.cpp)
@@ -88,4 +103,7 @@ foreach(app build_invlist build_coarse querying)
         ${RABITQ_CORE_SRC}
         ${RABITQ_SSD_UTILS_SRC})
     target_link_libraries(${app} PRIVATE rabitq_io)
+    if(RABITQ_PID64)
+        target_compile_definitions(${app} PRIVATE RABITQ_PID64)
+    endif()
 endforeach()

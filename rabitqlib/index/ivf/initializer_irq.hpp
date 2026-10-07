@@ -317,7 +317,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
         rabitqlib::RowMajorArray<uint32_t> inner_cids_arr;
         rabitqlib::load_matrix_auto<float, rabitqlib::RowMajorArray<float>>(
             inner_centroids_path_.c_str(), inner_orig);
-        rabitqlib::load_matrix_auto<PID, rabitqlib::RowMajorArray<uint32_t>>(
+        rabitqlib::load_matrix_auto<CID, rabitqlib::RowMajorArray<uint32_t>>(
             inner_cids_path_.c_str(), inner_cids_arr);
 
         if (static_cast<size_t>(inner_orig.cols()) != outer_dim_) {
@@ -344,15 +344,15 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
         }
 
         // ----- Group first-level centroids by inner cluster -----
-        std::vector<std::vector<PID>> id_lists(num_inner_cluster_);
+        std::vector<std::vector<CID>> id_lists(num_inner_cluster_);
         for (size_t i = 0; i < num_cluster_; ++i) {
-            const PID cid = static_cast<PID>(inner_cids_arr.data()[i]);
+            const CID cid = static_cast<CID>(inner_cids_arr.data()[i]);
             if (cid >= num_inner_cluster_) {
                 std::cerr << "IvfRabitqInitializer: bad inner cluster id "
                           << cid << " (num_inner=" << num_inner_cluster_ << ")\n";
                 std::exit(1);
             }
-            id_lists[cid].push_back(static_cast<PID>(i));
+            id_lists[cid].push_back(static_cast<CID>(i));
         }
 
         // ----- Layout (sizes, batch/ex offsets) -----
@@ -421,6 +421,11 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
 
             for (size_t i = 0; i < n; i += fastscan::kBatchSize) {
                 const size_t bn = std::min(fastscan::kBatchSize, n - i);
+                // A short last batch leaves factor slots unwritten; zero the
+                // block first so the .irq file does not depend on what memory held.
+                if (bn < fastscan::kBatchSize) {
+                    std::memset(batch_ptr, 0, batch_block_bytes);
+                }
                 quant::quantize_split_batch(
                     gathered.data() + (i * dim_), inner_c, bn, dim_,
                     kInnerExBits, batch_ptr, ex_ptr,
@@ -431,7 +436,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
 
             // Copy ids into the cluster-ordered ids_ array.
             std::memcpy(ids_.data() + cluster_id_offsets_[c], ids.data(),
-                        sizeof(PID) * n);
+                        sizeof(CID) * n);
         }
 
         std::cout << "IvfRabitqInitializer: built inner IVF-RaBitQ over "
@@ -552,7 +557,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
 
             const char* batch_ptr = batch_data_ + cluster_batch_offsets_[c];
             const char* ex_ptr = ex_data_ + cluster_ex_offsets_[c];
-            const PID* ids = ids_.data() + cluster_id_offsets_[c];
+            const CID* ids = ids_.data() + cluster_id_offsets_[c];
 
             const size_t iter = n / fastscan::kBatchSize;
             const size_t remain = n - (iter * fastscan::kBatchSize);
@@ -622,7 +627,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
     //   [float * num_cluster * pdim]      rotated_centroids_
     //   [float * num_inner * pdim]        inner_centroids_rot_
     //   [size_t * num_inner]              cluster_sizes_
-    //   [PID    * num_rabitq_coded]       ids_
+    //   [u32    * num_rabitq_coded]       ids_ (first-level centroid ids)
     //   [bytes]                            batch_data_
     //   [bytes]                            ex_data_
     //
@@ -661,7 +666,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
         out.write(reinterpret_cast<const char*>(cluster_sizes_.data()),
                   static_cast<std::streamsize>(sizeof(size_t) * nic));
         out.write(reinterpret_cast<const char*>(ids_.data()),
-                  static_cast<std::streamsize>(sizeof(PID) * ids_.size()));
+                  static_cast<std::streamsize>(sizeof(CID) * ids_.size()));
 
         const size_t batch_total_bytes = cluster_batch_offsets_[nic];
         const size_t ex_total_bytes = cluster_ex_offsets_[nic];
@@ -752,7 +757,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
         in.read(reinterpret_cast<char*>(cluster_sizes_.data()),
                 static_cast<std::streamsize>(sizeof(size_t) * nic));
         in.read(reinterpret_cast<char*>(ids_.data()),
-                static_cast<std::streamsize>(sizeof(PID) * rabitq_coded));
+                static_cast<std::streamsize>(sizeof(CID) * rabitq_coded));
 
         // Rebuild offset presums and allocate batch/ex blobs.
         cluster_batch_offsets_.assign(nic + 1, 0);
@@ -814,7 +819,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
    private:
     void scan_one_batch(const char* batch_data,
                         const char* ex_data,
-                        const PID* ids,
+                        const CID* ids,
                         const SplitBatchQuery<float>& q_obj,
                         size_t num_points,
                         MaxHeapTopK& knns,
@@ -907,7 +912,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
     std::vector<size_t> cluster_batch_offsets_;
     std::vector<size_t> cluster_ex_offsets_;
     std::vector<size_t> cluster_id_offsets_;
-    std::vector<PID> ids_;
+    std::vector<CID> ids_;
     char* batch_data_ = nullptr;
     char* ex_data_ = nullptr;
 

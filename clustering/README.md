@@ -23,6 +23,8 @@ OUTDIR_ENV=/path/to/indexes/<dataset>/clustering \
 
 Both variables are required, and the script exits with an instruction naming
 whichever is missing. `PYTHON_ENV` selects the interpreter (default `python3`).
+The base may be a float32 `train.fbin` or a uint8 `train.u8bin`; uint8 rows are
+converted to float32 as they are read.
 
 Outputs land in `OUTDIR_ENV`:
 
@@ -32,6 +34,9 @@ Outputs land in `OUTDIR_ENV`:
 | `clusterids_<C>.ivecs` | cluster id of every base vector, in base order |
 | `trained_centroids_<C>.fvecs` | the pre-assignment centroids, kept for reference |
 | `build_report_C<C>_cpu_full.json` | per-phase timings, `assign_recall@1`, cluster imbalance |
+
+With `METRIC_ENV=ip` every name ends in `_ip`, as in `centroids_<C>_ip.fvecs`,
+so an l2 and an ip clustering of one dataset can share `OUTDIR_ENV`.
 
 `assign_recall@1` is how often the approximate assignment picked the true
 nearest centroid; `imbalance` is the cluster size-balance factor, 1.0 being
@@ -65,8 +70,8 @@ derived from the base file, so nothing needs configuring per dataset. See
 `C_ENV` / `METRIC_ENV` overrides.
 
 The remaining knobs are fixed in the runner: 240 points per centroid, HNSW
-efSearch 64, 25 iterations, seed 1234. Seeding makes the result deterministic —
-the same `(base, C, nc1, pts_per_centroid, seed)` gives identical centroids.
+efSearch 64, 25 iterations. The sample and the k-means draw a random seed per
+run and print it; `two_level_kmeans.py --seed` repeats a run exactly.
 
 To change something the runner does not expose, call the driver directly;
 `two_level_kmeans.py --help` lists every flag.
@@ -128,5 +133,6 @@ RABITQ_IRQ_INNER_SIZE=1000 python ivf_centroids.py \
 ```
 
 `inner_size` defaults to 1000. The metric must match the one the index is built
-with (`ip` uses spherical k-means and IP routing). The trailing argument selects
-the inner-centroid scheme; `mean` is the only accepted value.
+with (`ip` uses spherical k-means and IP routing), and for `ip` `build_index.sh`
+reads `centroids_<C>_ip.fvecs` and ends both output names in `_ip`. The trailing
+argument selects the inner-centroid scheme; `mean` is the only accepted value.

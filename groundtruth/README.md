@@ -2,7 +2,9 @@
 
 Produces the `gt10 / gt100 / gt1000` files the query stage consumes. Run this
 once per dataset, after `train.fbin` and `test.fbin` are in place and before
-building the index.
+building the index. `compute_gt_type1_l2exact.py` also reads uint8 `.u8bin`
+files. DINO-10B needs none of this: it ships its own ground truth, which
+[`tools/dino_prepare.py`](../tools/dino_prepare.py) converts.
 
 ## Format
 

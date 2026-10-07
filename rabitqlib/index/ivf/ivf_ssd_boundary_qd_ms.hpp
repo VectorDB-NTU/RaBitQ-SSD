@@ -5,6 +5,7 @@
 namespace rabitqlib::ivf_ssd_boundary_qd_ms
 {
     using CoarseKind = ivf_ssd_boundary_qd_ms_detail::CoarseKind;
+    using SsdStore = ivf_ssd_boundary_qd_ms_detail::SsdStore;
     using SearchStats = ivf_ssd_boundary_qd_ms_detail::SearchStats;
     using SingleCandidate = ivf_ssd_boundary_qd_ms_detail::SingleCandidate;
     using PageCandidates = ivf_ssd_boundary_qd_ms_detail::PageCandidates;

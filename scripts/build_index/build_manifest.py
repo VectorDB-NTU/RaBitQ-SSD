@@ -56,10 +56,12 @@ def parse_index_dir(idx_dir):
     name = os.path.basename(os.path.normpath(idx_dir))
     # indexes/<dataset>/idx_... -> the parent dir IS the dataset name.
     dataset = os.path.basename(os.path.dirname(os.path.normpath(idx_dir)))
-    # idx_C96422_cpu_B9_memdim1280_l2_ordered
+    # idx_C96422_cpu_B9_memdim1280_l2_ordered, or ..._cpu_raw_memdim... for an
+    # index whose SSD records hold the vectors themselves (STORE_ENV=raw).
     g = lambda pat, d="": (re.search(pat, name).group(1) if re.search(pat, name) else d)
     C = g(r"_C(\d+)")
     B = g(r"_B(\d+)")
+    raw = re.search(r"_cpu_raw_", name) is not None
     memdim = g(r"memdim(\d+)")
     metric = g(r"_(l2|ip|cosine)_")
     order = g(r"_(ordered|unordered)")
@@ -105,7 +107,8 @@ def parse_index_dir(idx_dir):
         "index_id": name,
         "system": SYSTEM,
         "dataset": dataset,
-        "build_params": f"C={C};B={B};memdim={memdim};metric={metric};order={order};"
+        "build_params": f"C={C};{'store=raw' if raw else f'B={B}'};memdim={memdim};"
+                        f"metric={metric};order={order};"
                         f"budget_gb={budget_gb};kmeans=shared/amortized",
         "build_s": build_s,
         "build_peak_rss_mb": build_peak_rss_mb,

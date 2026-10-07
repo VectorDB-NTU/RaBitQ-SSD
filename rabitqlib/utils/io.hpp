@@ -31,7 +31,8 @@ void load_vecs(const char* filename, M& row_mat) {
         exit(1);
     }
 
-    assert((std::is_same_v<T*, std::decay_t<decltype(row_mat.data())>> == true));
+    static_assert(std::is_same_v<T*, std::decay_t<decltype(row_mat.data())>>,
+                  "the element type T must match the matrix element type");
 
     uint32_t tmp;
     size_t file_size = get_filesize(filename);
@@ -40,7 +41,17 @@ void load_vecs(const char* filename, M& row_mat) {
     input.read(reinterpret_cast<char*>(&tmp), sizeof(uint32_t));
 
     size_t cols = tmp;
-    size_t rows = file_size / (cols * sizeof(T) + sizeof(uint32_t));
+    // Every row is [u32 dim][dim values of T]. A file that is not a whole
+    // number of such rows holds values of a different width -- a uint8 .bvecs
+    // handed to a float reader, say -- and would otherwise be read as garbage.
+    const size_t row_bytes = cols * sizeof(T) + sizeof(uint32_t);
+    if (cols == 0 || file_size % row_bytes != 0) {
+        std::cerr << "File " << filename << " is not a whole number of rows of " << cols
+                  << " values of " << sizeof(T)
+                  << " bytes each; it was written with a different value type\n";
+        exit(1);
+    }
+    size_t rows = file_size / row_bytes;
     row_mat = M(rows, cols);
 
     input.seekg(0, std::ifstream::beg);
@@ -63,7 +74,8 @@ void load_bin(const char* filename, M& row_mat) {
         exit(1);
     }
 
-    assert((std::is_same_v<T*, std::decay_t<decltype(row_mat.data())>> == true));
+    static_assert(std::is_same_v<T*, std::decay_t<decltype(row_mat.data())>>,
+                  "the element type T must match the matrix element type");
 
     uint32_t rows;
     uint32_t cols;
@@ -71,6 +83,20 @@ void load_bin(const char* filename, M& row_mat) {
 
     input.read(reinterpret_cast<char*>(&rows), sizeof(uint32_t));
     input.read(reinterpret_cast<char*>(&cols), sizeof(uint32_t));
+
+    // The header promises rows*cols values of T. A smaller file was written
+    // with narrower values (a .u8bin read as float) or is truncated; reading it
+    // anyway would fill the matrix with garbage. A larger file is allowed: a
+    // DiskANN type-1 ground truth keeps a distance block after the ids.
+    const size_t need = 2 * sizeof(uint32_t) + static_cast<size_t>(rows) * cols * sizeof(T);
+    const size_t have = get_filesize(filename);
+    if (have < need) {
+        std::cerr << "File " << filename << " declares " << rows << " x " << cols
+                  << " values of " << sizeof(T) << " bytes, which needs " << need
+                  << " bytes, but holds " << have
+                  << "; it is truncated or was written with a narrower value type\n";
+        exit(1);
+    }
 
     row_mat = M(rows, cols);
 

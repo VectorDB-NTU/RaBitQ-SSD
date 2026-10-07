@@ -229,5 +229,10 @@ build, with the search sweep on top of that.
 - Inner-product data: repeat `METRIC_ENV=ip` for clustering, build, and search. (YFCC
   vectors are normalized, so its L2 ground truth stays valid under
   inner-product search.)
+- Full-precision vectors on SSD: repeat `STORE_ENV=raw` for build and search.
+  The SSD then holds the float32 vectors and re-ranking is exact; each YFCC
+  record takes two pages instead of one.
+- Billions of uint8 vectors: [dino.md](dino.md) runs the DINO-10B prefixes of
+  the paper's scaling experiment with one command per size.
 - The full parameter list is in the [README](../README.md), and every binary
   under `bin/` prints its arguments when run with none.

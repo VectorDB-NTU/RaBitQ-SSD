@@ -3,11 +3,19 @@
 The three binaries in `bin/`. The scripts under `scripts/` drive them for you —
 this page is for calling them directly, or for understanding what a script did.
 
+A build configured with `-DRABITQ_PID64=ON` puts the same three binaries in
+`bin64/`, with 64-bit point ids for datasets of more than 2^32 - 1 vectors.
+The default build also addresses at most 2^31 - 1 SSD pages, an 8 TiB SSD
+file, and refuses a larger index when it builds or loads one. Each build
+reads only the indexes it wrote and says so otherwise.
+
 Every binary prints a usage summary when run with no arguments.
 
 Vector files are `.fbin`: `[int32 n][int32 d]` then `n·d` float32 values, row by
-row. `.fvecs` is auto-detected where noted; convert with
-[`tools/fvecs_to_fbin.py`](../tools/fvecs_to_fbin.py).
+row. `.u8bin` has the same layout with uint8 values. `.fvecs` and its uint8
+counterpart `.bvecs` are auto-detected where noted; convert with
+[`tools/fvecs_to_fbin.py`](../tools/fvecs_to_fbin.py). The extension decides the
+value type, so a file must carry the right one.
 
 ---
 
@@ -20,15 +28,18 @@ bin/build_invlist <data> <centroids> <cluster_ids> <total_bits> <base_index> <ss
 Six required positional arguments, then any number of optional ones in any
 order.
 
-1. **data**: the vectors to index, `.fbin` or `.fvecs` (auto-detected).
+1. **data**: the vectors to index: float32 `.fbin` or `.fvecs`, or uint8
+   `.u8bin` or `.bvecs` (auto-detected from the extension).
 2. **centroids**: the cluster centroids, `.fvecs`, as produced by
    `clustering/run_kmeans.sh`.
-3. **cluster_ids**: the cluster assignment of every base vector, `.ivecs`, from
-   the same run. It must have been produced against the same centroids —
-   nothing checks this, and a mismatch yields a silently wrong index.
+3. **cluster_ids**: the cluster assignment of every base vector, from the same
+   run: `.ivecs`, or `.cid64` from the DINO GPU clustering
+   (`[u64 magic][u64 version][u64 n][u64 C]` then `n` uint32). It must have
+   been produced against the same centroids — nothing checks this beyond the
+   cluster count, and a mismatch yields a silently wrong index.
 4. **total_bits**: bits per dimension for the quantized code. The scripts use
    9: one sign bit plus 8 bits of extra precision. Fewer bits shrink the index
-   and lower recall at a given `nprobe`.
+   and lower recall at a given `nprobe`. Ignored by `store=raw`.
 5. **base_index**: output path for the in-RAM part of the index.
 6. **ssd_index**: output path for the on-SSD part. Put it on the device you
    intend to search from; reads use `O_DIRECT` to bypass the Linux page cache.
@@ -53,11 +64,22 @@ Optional arguments, recognised by their form rather than their position:
     whole. **The resulting index is the same either way** — this only decides
     whether the build fits in memory. Keyed rather than positional
     because the bare-integer slot is already `memdim`.
+12. **`store=exbits`** or **`store=raw`** (default `exbits`): what the SSD
+    records hold. `exbits` stores the dimensions of the 1-bit code beyond
+    `memdim` plus the extra-precision codes, and re-ranks with the estimated
+    distance. `raw` stores every vector as given, float32 or uint8 according to
+    the input, zero-padded to a multiple of 64 dimensions, and re-ranks with the
+    exact distance; `total_bits` is then ignored. The choice is recorded in the
+    base index, so `querying` needs no matching flag.
+13. **`rows=<N>`** (default: every row): index only the first `N` rows of
+    `data`, for a prefix of a larger file. `cluster_ids` must hold exactly `N`
+    assignments.
 
 The streaming path trades DRAM for disk: it reorders every vector into a
 scratch directory first, so it needs **free disk equal to the dataset size**,
-released once the build finishes. `RABITQ_BUILD_SCRATCH_DIR` chooses where that
-goes; the default is beside the data file. The space is checked up front, so an
+released once the build finishes; uint8 input stays uint8 there.
+`RABITQ_BUILD_SCRATCH_DIR` chooses where that goes; the default is beside the
+data file. The space is checked up front, so an
 undersized volume fails immediately rather than hours in.
 
 The build prints the metric, quantization mode, order mode and build mode it
@@ -105,9 +127,13 @@ bin/querying <base_index> <ssd_index> <coarse_index> <query> <gt> <threads> [key
 1. **base_index**: the in-RAM part written by `build_invlist`.
 2. **ssd_index**: the on-SSD part from the same run.
 3. **coarse_index**: from `build_coarse`.
-4. **query**: the queries, `.fbin` or `.fvecs`.
+4. **query**: the queries: float32 `.fbin` or `.fvecs`, or uint8 `.u8bin` or
+   `.bvecs`. Their dimension must match the index.
 5. **gt**: ground truth. Either ids only, or ids plus distances
    ("type-1": `[int32 nq][int32 k][nq·k uint32 ids][nq·k float32 dists]`).
+   Ids beyond 32 bits come as `.gt64`, recognised by its header:
+   `[u64 magic][u64 version][u64 nq][u64 k]` then `nq·k` uint64 ids; `bin/`
+   accepts it when every id fits in 32 bits.
    With distances, a result counts as correct if it ties with the k-th
    neighbour, which is what makes recall meaningful when the data contains
    duplicate vectors. Must hold at least `topk` neighbours per row. The binary
@@ -134,6 +160,10 @@ Then any number of `key=value` options, in any order:
 
 `memdim` and `use_hacc` also accept a bare value: a bare integer is read as
 `memdim` (not as `topk`), and a bare `true`/`false` as `use_hacc`.
+
+The SSD store comes from the base index, and the binary prints it as a line
+`SSD store: exbits (B=9)` or `SSD store: raw (uint8 records)`; the search
+scripts check that line before keeping a result.
 
 **`drain_alpha`** changes the pruning threshold during the drain phase only.
 While scanning the selected clusters, the search uses the standard top-k

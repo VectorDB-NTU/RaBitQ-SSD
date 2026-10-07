@@ -17,6 +17,9 @@ than RAM runs inside a few hundred GB. The span `first base read -> centroids +
 clusterids written` is wrapped in ONE wall-clock measurement, which is this stage's
 indexing-time contribution; diagnostics stay outside it.
 
+The base is a .fbin (float32) or a .u8bin (uint8, e.g. DINO-10B); uint8 rows are
+widened to float32 as they are read, so everything downstream is unchanged.
+
 Semantics:
   - faiss.contrib.clustering.two_level_clustering, cost ~ O(n_train * sqrt(C) * d)
     instead of the flat O(n_train * C * d)
@@ -55,17 +58,30 @@ from faiss.contrib.clustering import two_level_clustering
 
 
 # --------------------------------------------------------------------------- #
-# .fbin IO -- partial-file safe: a base still being written has a header row count
-# larger than the rows on disk, so the memmap covers rows_present, not the header n.
+# .fbin / .u8bin IO -- partial-file safe: a base still being written has a header row
+# count larger than the rows on disk, so the memmap covers rows_present, not the header n.
 # --------------------------------------------------------------------------- #
+def base_dtype(path):
+    """Value type of a base file, from its extension: .u8bin is uint8, anything else
+    (.fbin) float32. .i8bin is int8, which the index cannot read, so it is refused."""
+    ext = os.path.splitext(path)[1].lower()
+    if ext == ".i8bin":
+        raise SystemExit(f"[FATAL] {path}: int8 vectors (.i8bin) are not supported; "
+                         f"use float32 (.fbin) or uint8 (.u8bin)")
+    return np.uint8 if ext == ".u8bin" else np.float32
+
+
 def safe_memmap_fbin(path):
     """Return (arr, n_header, d, rows_present). arr is a read-only memmap over the
     rows ACTUALLY present on disk (not the header n), so it never raises
-    'mmap length is greater than file size' on a still-copying base."""
+    'mmap length is greater than file size' on a still-copying base. Its dtype is
+    float32 for a .fbin and uint8 for a .u8bin; every reader below converts what it
+    takes to float32."""
+    dtype = base_dtype(path)
     n_header, d = (int(v) for v in np.fromfile(path, dtype=np.int32, count=2))
     size = os.path.getsize(path)
     payload = size - 8
-    rowbytes = d * 4
+    rowbytes = d * np.dtype(dtype).itemsize
     # floor to whole rows: a file still being written may end mid-row at any instant --
     # that trailing partial row is "not yet present", not corruption.
     rows_present = payload // rowbytes
@@ -74,7 +90,7 @@ def safe_memmap_fbin(path):
         print(f"[io] {path}: {leftover}B trailing partial row (copy in progress) -> "
               f"using {rows_present:,} whole rows", flush=True)
     # memmap over whole rows only; the file only grows, so this never exceeds the file size.
-    arr = np.memmap(path, dtype=np.float32, mode="r", offset=8, shape=(rows_present, d))
+    arr = np.memmap(path, dtype=dtype, mode="r", offset=8, shape=(rows_present, d))
     return arr, n_header, d, rows_present
 
 
@@ -115,7 +131,7 @@ def read_fvecs(path):
 # --------------------------------------------------------------------------- #
 # Reservoir subsample (sorted indices -> monotonic memmap read on the SSD).
 # --------------------------------------------------------------------------- #
-def reservoir_sample(arr, n_pool, n_train, seed=1234, gather_block=1_000_000,
+def reservoir_sample(arr, n_pool, n_train, seed=None, gather_block=1_000_000,
                      verbose=True):
     """Draw n_train rows uniformly without replacement from arr[:n_pool] into a
     contiguous float32 RAM array. Indices are sorted before the gather so the
@@ -254,7 +270,7 @@ def assign_hnsw_accumulate(arr, n_assign, centroids, C, d, M, efc, efs, batch,
 
 
 def run_efs_sweep(arr, n_pool, centroids, C, d, efs_list, sweep_n, metric, out_dir,
-                  M=32, efc=200, seed=123):
+                  M=32, efc=200, seed=None, suffix=""):
     """Pick efSearch empirically: build one HNSW over the trained centroids, then for each
     efSearch measure recall@1 (vs EXACT flat) and search throughput on a base-point sample.
     Throughput is HNSW-compute-bound (sample held in RAM) so it ~= the full-assign rate.
@@ -285,7 +301,7 @@ def run_efs_sweep(arr, n_pool, centroids, C, d, efs_list, sweep_n, metric, out_d
                         "Mpts_s": mpts, "full_1B_assign_hours": full_h})
         print(f"[sweep]  efS={int(efs):4d}  recall@1={rec:.4f}  {mpts:.3f} Mpts/s  "
               f"-> full 1B assign ~{full_h:.1f} h", flush=True)
-    path = os.path.join(out_dir, f"efs_sweep_C{C}.json")
+    path = os.path.join(out_dir, f"efs_sweep_C{C}{suffix}.json")
     with open(path, "w") as f:
         json.dump({"C": C, "M": M, "efC": efc, "sweep_n": int(len(x)),
                    "results": results}, f, indent=2)
@@ -306,15 +322,20 @@ def imbalance_factor(cluster_id, C):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--base", required=True,
-                    help="path to the dataset's base/train .fbin (REQUIRED)")
+                    help="path to the dataset's base/train .fbin or .u8bin (REQUIRED)")
     ap.add_argument("--out-dir", required=True,
                     help="directory that receives centroids_<C>.fvecs / clusterids_<C>.ivecs "
                          "and the build report (REQUIRED; created if missing)")
+    ap.add_argument("--name-suffix", default=None,
+                    help="appended to every output file name, so runs with different "
+                         "settings can share --out-dir (default: _ip for --metric ip, "
+                         "nothing for l2, the names the build scripts look for)")
     ap.add_argument("--dataset", default=None,
                     help="dataset name used in log prefixes and the build report's 'dataset' "
                          "field (default: inferred from --base's parent directory name, e.g. "
                          "'.../datasets/<dataset>/train.fbin' -> '<dataset>')")
-    ap.add_argument("--C", type=int, default=None, help="num centroids (default N//1024)")
+    ap.add_argument("--C", type=int, default=None,
+                    help="num centroids (default ceil(N/1024), as in scripts/_params.sh)")
     ap.add_argument("--nc1", type=int, default=None, help="L1 coarse cells (default round(sqrt(C)))")
     ap.add_argument("--pts-per-centroid", type=int, default=240,
                     help="n_train = this * C; the sample needs n_train * d * 4 bytes "
@@ -329,7 +350,9 @@ def main():
                     help="cpu: HNSW efSearch (recall@1 vs speed knob for assignment)")
     ap.add_argument("--metric", choices=["l2", "ip"], default="l2")
     ap.add_argument("--niter", type=int, default=25, help="L1 (coarse) k-means iterations")
-    ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument("--seed", type=int, default=None,
+                    help="random seed of the sampling and the k-means (default: drawn "
+                         "at random and printed, so a run can be repeated)")
     ap.add_argument("--ngpu", type=int,
                     default=faiss.get_num_gpus() if hasattr(faiss, "get_num_gpus") else 1)
     ap.add_argument("--use-float16", action="store_true",
@@ -397,7 +420,7 @@ def main():
     timings = {}
 
     arr, N_header, d, rows_present = safe_memmap_fbin(args.base)
-    C = args.C if args.C else N_header // 1024     # ALWAYS from full header N (fixed in calib)
+    C = args.C if args.C else -(-N_header // 1024)  # ceil(N/1024); ALWAYS from full header N (fixed in calib)
     nc1 = args.nc1 if args.nc1 else int(round(math.sqrt(C)))
     n_train = args.n_train if args.n_train else args.pts_per_centroid * C
     n_train = min(n_train, N_header)
@@ -414,12 +437,17 @@ def main():
     n_train_eff = min(n_train_eff, pool)
     n_assign = min(pool, args.calib_n_assign) if args.calib_n_assign else pool
 
+    if args.seed is None:
+        args.seed = int(np.random.default_rng().integers(1, 2**31 - 1))
     print(f"[{dataset}] mode={mode} N_header={N_header:,} rows_present={rows_present:,} "
           f"d={d} C={C} nc1={nc1} n_train={n_train_eff:,} n_assign={n_assign:,} "
           f"metric={args.metric} ngpu={args.ngpu} fp16={args.use_float16} "
-          f"pts/centroid={n_train_eff/C:.1f}", flush=True)
+          f"pts/centroid={n_train_eff/C:.1f} seed={args.seed}", flush=True)
 
-    trained_path = os.path.join(args.out_dir, f"trained_centroids_{C}.fvecs")
+    sfx = args.name_suffix
+    if sfx is None:
+        sfx = "_ip" if args.metric == "ip" else ""
+    trained_path = os.path.join(args.out_dir, f"trained_centroids_{C}{sfx}.fvecs")
 
     # ---- 1+2. trained (routing) centroids: load a checkpoint, OR subsample + cluster ----
     if args.centroids_from:
@@ -465,15 +493,16 @@ def main():
         if args.efs_sweep:
             efs_list = [int(v) for v in args.efs_sweep.split(",") if v.strip()]
             run_efs_sweep(arr, pool, cen_trained, C, d, efs_list, args.sweep_n,
-                          metric, args.out_dir, M=args.hnsw_M, efc=args.hnsw_efc)
+                          metric, args.out_dir, M=args.hnsw_M, efc=args.hnsw_efc,
+                          seed=args.seed, suffix=sfx)
         rep = {"dataset": dataset, "line": args.line, "mode": "cluster_only",
                "C": int(C), "nc1": int(nc1), "n_train": int(n_train_eff),
                "pts_per_centroid": float(n_train_eff / C),
                "trained_centroids_file": trained_path, "timings_s": timings}
-        with open(os.path.join(args.out_dir, f"cluster_report_C{C}_{args.line}.json"), "w") as f:
+        with open(os.path.join(args.out_dir, f"cluster_report_C{C}_{args.line}{sfx}.json"), "w") as f:
             json.dump(rep, f, indent=2)
         print(f"[{dataset}] cluster report -> "
-              f"{os.path.join(args.out_dir, f'cluster_report_C{C}_{args.line}.json')}", flush=True)
+              f"{os.path.join(args.out_dir, f'cluster_report_C{C}_{args.line}{sfx}.json')}", flush=True)
         return
 
     # ---- 3. assign all N to the trained centroids + accumulate per-cluster sums ----
@@ -482,7 +511,7 @@ def main():
         gpu_index = gpu_flat_index(cen_trained, metric, args.ngpu, args.use_float16)
         cluster_id, sums, counts = assign_and_accumulate(
             arr, n_assign, gpu_index, C, d, args.assign_batch,
-            ckpt_path=(os.path.join(args.out_dir, f"clusterids_{C}.ckpt.npz")
+            ckpt_path=(os.path.join(args.out_dir, f"clusterids_{C}{sfx}.ckpt.npz")
                        if args.checkpoint else None),
             resume=args.resume)
     else:                                                      # APPROXIMATE CPU HNSW
@@ -497,8 +526,8 @@ def main():
     out_centroids[nonempty] = (sums[nonempty] / counts[nonempty, None]).astype(np.float32)
     n_empty = int((~nonempty).sum())
 
-    cen_path = os.path.join(args.out_dir, f"centroids_{C}.fvecs")
-    cid_path = os.path.join(args.out_dir, f"clusterids_{C}.ivecs")
+    cen_path = os.path.join(args.out_dir, f"centroids_{C}{sfx}.fvecs")
+    cid_path = os.path.join(args.out_dir, f"clusterids_{C}{sfx}.ivecs")
     t = time.time(); write_fvecs_fast(cen_path, out_centroids); timings["write_centroids_s"] = time.time() - t
     t = time.time(); write_ivecs_fast(cid_path, cluster_id); timings["write_assign_s"] = time.time() - t
 
@@ -529,7 +558,7 @@ def main():
     # CPU/HNSW assignment is approximate -> always report recall@1 (vs exact). For the GPU
     # line (exact) it's a ~1.0 sanity check, only when --validate. Runs AFTER the timed span.
     if args.validate or args.line == "cpu":
-        rng = np.random.default_rng(7)
+        rng = np.random.default_rng(args.seed)
         smp = np.sort(rng.choice(n_assign, size=min(100_000, n_assign), replace=False))
         x = np.ascontiguousarray(arr[smp], dtype=np.float32)
         flat = (faiss.IndexFlatIP(d) if metric == faiss.METRIC_INNER_PRODUCT
@@ -552,7 +581,7 @@ def main():
               f"assign~{timings['assign_s']*fa:.0f}s (x{fa:.1f})", flush=True)
 
     rep_path = os.path.join(args.out_dir,
-                            f"build_report_C{C}_{args.line}_{mode}.json")
+                            f"build_report_C{C}_{args.line}_{mode}{sfx}.json")
     with open(rep_path, "w") as f:
         json.dump(report, f, indent=2)
     print(f"\n=== {dataset} build report ===")

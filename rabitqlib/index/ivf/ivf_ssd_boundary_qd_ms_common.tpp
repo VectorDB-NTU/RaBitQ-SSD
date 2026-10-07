@@ -2,6 +2,7 @@
 
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -40,7 +41,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         free_page_slots.reserve(target_slots);
         for (size_t i = target_slots; i > old_size; --i)
         {
-            free_page_slots.push_back(static_cast<PID>(i - 1));
+            free_page_slots.push_back(static_cast<SlotID>(i - 1));
         }
     }
 
@@ -50,10 +51,10 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         free_page_slots.reserve(page_slots.size());
         for (size_t i = page_slots.size(); i > 0; --i)
         {
-            const PID slot_id = static_cast<PID>(i - 1);
+            const SlotID slot_id = static_cast<SlotID>(i - 1);
             PageCandidates &slot = page_slots[slot_id];
             slot.page_lower_bound = 0.0F;
-            slot.probe_idx = static_cast<PID>(-1);
+            slot.probe_idx = static_cast<CID>(-1);
             slot.page_id = -1;
             slot.req_slot = -1;
             slot.candidate_num = 0;
@@ -67,7 +68,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         {
             const int slot = req_slot - 1;
             reqs[slot] = IORequest();
-            req_slot_owner[slot] = kPidMax;
+            req_slot_owner[slot] = kSlotMax;
             free_req_slots.push_back(slot);
         }
     }
@@ -77,7 +78,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         return sector_scratch + static_cast<size_t>(req_slot) * request_slot_bytes;
     }
 
-    inline SingleCandidate *QueryBuffer::slot_candidates(PID slot_id)
+    inline SingleCandidate *QueryBuffer::slot_candidates(SlotID slot_id)
     {
         assert(slot_id < page_slots.size());
         return candidate_storage.data() +
@@ -85,7 +86,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                    static_cast<size_t>(page_candidate_capacity);
     }
 
-    inline const SingleCandidate *QueryBuffer::slot_candidates(PID slot_id) const
+    inline const SingleCandidate *QueryBuffer::slot_candidates(SlotID slot_id) const
     {
         assert(slot_id < page_slots.size());
         return candidate_storage.data() +
@@ -113,7 +114,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         return entries_.size() - head_;
     }
 
-    inline void ArrayPendingSet::insert(PID slot_id, float key)
+    inline void ArrayPendingSet::insert(SlotID slot_id, float key)
     {
         compact_if_needed();
         const auto begin_it = entries_.begin() + static_cast<ptrdiff_t>(head_);
@@ -124,7 +125,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         entries_.insert(it, Entry{slot_id, key});
     }
 
-    inline PID ArrayPendingSet::front_slot() const
+    inline SlotID ArrayPendingSet::front_slot() const
     {
         assert(!empty());
         return entries_[head_].slot_id;
@@ -138,7 +139,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     }
 
     inline void ArrayPendingSet::prune_greater(float distk,
-                                               std::vector<PID> &pruned_slots)
+                                               std::vector<SlotID> &pruned_slots)
     {
         const auto begin_it = entries_.begin() + static_cast<ptrdiff_t>(head_);
         const auto it = std::upper_bound(
@@ -199,7 +200,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     }
 
     template <class PendingSet>
-    inline PID PageCandidate_IO_Queue<PendingSet>::acquire_page_candidate_slot(
+    inline SlotID PageCandidate_IO_Queue<PendingSet>::acquire_page_candidate_slot(
         QueryBuffer *query_buf)
     {
         if (query_buf->free_page_slots.empty())
@@ -211,11 +212,11 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             ensure_slot_capacity(query_buf->page_slots.size());
         }
 
-        const PID slot_id = query_buf->free_page_slots.back();
+        const SlotID slot_id = query_buf->free_page_slots.back();
         query_buf->free_page_slots.pop_back();
         PageCandidates &slot = query_buf->page_slots[slot_id];
         slot.page_lower_bound = 0.0F;
-        slot.probe_idx = static_cast<PID>(-1);
+        slot.probe_idx = static_cast<CID>(-1);
         slot.page_id = -1;
         slot.req_slot = -1;
         slot.candidate_num = 0;
@@ -225,12 +226,12 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
     template <class PendingSet>
     inline void PageCandidate_IO_Queue<PendingSet>::release_page_slot(
-        QueryBuffer *query_buf, PID slot_id)
+        QueryBuffer *query_buf, SlotID slot_id)
     {
         assert(slot_id < query_buf->page_slots.size());
         PageCandidates &slot = query_buf->page_slots[slot_id];
         slot.page_lower_bound = 0.0F;
-        slot.probe_idx = static_cast<PID>(-1);
+        slot.probe_idx = static_cast<CID>(-1);
         slot.page_id = -1;
         slot.req_slot = -1;
         slot.candidate_num = 0;
@@ -247,10 +248,10 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         {
             return;
         }
-        std::vector<PID> pruned_slots;
+        std::vector<SlotID> pruned_slots;
         pruned_slots.reserve(pending_.size());
         pending_.prune_greater(distk, pruned_slots);
-        for (PID slot_id : pruned_slots)
+        for (SlotID slot_id : pruned_slots)
         {
             assert(slot_state_[slot_id] == kStatePending);
             release_page_slot(query_buf, slot_id);
@@ -259,7 +260,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
     template <class PendingSet>
     inline int PageCandidate_IO_Queue<PendingSet>::push_into_submit_candidate_pool(
-        PID slot_id, float page_lower_bound, SearchStats *)
+        SlotID slot_id, float page_lower_bound, SearchStats *)
     {
         assert(slot_id < slot_state_.size());
         assert(slot_state_[slot_id] == kStateReserved ||
@@ -271,7 +272,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
     template <class PendingSet>
     inline void PageCandidate_IO_Queue<PendingSet>::prepare_request(
-        QueryBuffer *query_buf, PID slot_id, int req_slot)
+        QueryBuffer *query_buf, SlotID slot_id, int req_slot)
     {
         PageCandidates &cand = query_buf->page_slots[slot_id];
         char *buf = query_buf->request_buffer(req_slot);
@@ -305,7 +306,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         {
             while (budget > 0 && !pending_.empty())
             {
-                const PID slot_id = pending_.front_slot();
+                const SlotID slot_id = pending_.front_slot();
                 pending_.pop_front();
                 slot_state_[slot_id] = kStateCompleted;
                 ready_completed_.push_back(slot_id);
@@ -330,7 +331,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         while (budget > 0 && !pending_.empty() &&
                !query_buf->free_req_slots.empty())
         {
-            const PID slot_id = pending_.front_slot();
+            const SlotID slot_id = pending_.front_slot();
             pending_.pop_front();
 
             const int req_slot = query_buf->free_req_slots.back();
@@ -420,7 +421,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
         if (empty_ssd)
         {
-            for (PID slot_id : ready_completed_)
+            for (SlotID slot_id : ready_completed_)
             {
                 query_buf->completed_slots.push_back(slot_id);
                 ++n_completed;
@@ -475,8 +476,8 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             }
 
             const int req_slot = static_cast<int>(diff);
-            const PID slot_id = query_buf->req_slot_owner[req_slot];
-            if (slot_id == kPidMax || slot_id >= slot_state_.size() ||
+            const SlotID slot_id = query_buf->req_slot_owner[req_slot];
+            if (slot_id == kSlotMax || slot_id >= slot_state_.size() ||
                 slot_state_[slot_id] != kStateInflight)
             {
                 continue;
@@ -494,7 +495,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
     template <class PendingSet>
     inline const char *PageCandidate_IO_Queue<PendingSet>::completed_data(
-        const QueryBuffer *query_buf, PID slot_id) const
+        const QueryBuffer *query_buf, SlotID slot_id) const
     {
         if (slot_id >= slot_req_slot_.size())
         {
@@ -510,7 +511,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
     template <class PendingSet>
     inline void PageCandidate_IO_Queue<PendingSet>::release_completed_slot(
-        QueryBuffer *query_buf, PID slot_id)
+        QueryBuffer *query_buf, SlotID slot_id)
     {
         assert(slot_id < slot_state_.size());
         assert(slot_state_[slot_id] == kStateCompleted);
@@ -520,7 +521,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         {
             assert(query_buf->req_slot_owner[req_slot] == slot_id);
             query_buf->reqs[req_slot] = IORequest();
-            query_buf->req_slot_owner[req_slot] = kPidMax;
+            query_buf->req_slot_owner[req_slot] = kSlotMax;
             query_buf->free_req_slots.push_back(req_slot);
         }
 
@@ -580,6 +581,197 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     }
 
     template <class PendingSet>
+    inline void IVFSSD_Index<PendingSet>::set_ssd_store(SsdStore store,
+                                                        VecElemType raw_elem)
+    {
+        ssd_store_ = store;
+        raw_elem_ = raw_elem;
+        if (store == SsdStore::Raw)
+        {
+            // A raw record replaces both the SSD part of the 1-bit code and
+            // the extra-precision code, so no ex-code is computed or stored.
+            ex_bits_ = 0;
+        }
+        init_layout_metadata();
+        log_ssd_layout();
+    }
+
+    template <class PendingSet>
+    inline void IVFSSD_Index<PendingSet>::write_raw_record(char *dst,
+                                                           const float *src) const
+    {
+        if (raw_elem_ == VecElemType::F32)
+        {
+            std::memcpy(dst, src, dim_ * sizeof(float));
+            return;
+        }
+        // uint8 input reached the build widened to float, which is exact, so
+        // narrowing it back is lossless. That is checked rather than assumed:
+        // a value that is not an integer in [0, 255] means the input was not
+        // uint8 after all, and storing a rounded value would give wrong
+        // distances without any error.
+        auto *out = reinterpret_cast<uint8_t *>(dst);
+        for (size_t j = 0; j < dim_; ++j)
+        {
+            const float v = src[j];
+            if (!(v >= 0.0F && v <= 255.0F) || v != std::floor(v))
+            {
+                LOG(ERROR) << "raw uint8 store: input value " << v
+                           << " in dimension " << j
+                           << " is not an integer in [0, 255]";
+                std::exit(1);
+            }
+            out[j] = static_cast<uint8_t>(v);
+        }
+    }
+
+    template <class PendingSet>
+    inline void IVFSSD_Index<PendingSet>::read_base_store_fields(
+        std::istream &input, uint32_t version, const std::string &base_index_file)
+    {
+#if defined(RABITQ_PID64)
+        if (version == kBaseVersion || version == kBaseVersionWithStore)
+        {
+            LOG(ERROR) << base_index_file << " was built with 32-bit point ids; "
+                          "use the default build (bin/) for it";
+            std::exit(1);
+        }
+        if (version != kBaseVersionPid64)
+        {
+            LOG(ERROR) << "Unsupported base index version " << version
+                       << " (expected " << kBaseVersionPid64
+                       << "): " << base_index_file;
+            std::exit(1);
+        }
+#else
+        if (version == kBaseVersion)
+        {
+            ssd_store_ = SsdStore::ExBits;
+            raw_elem_ = VecElemType::F32;
+            return;
+        }
+        if (version == kBaseVersionPid64)
+        {
+            LOG(ERROR) << base_index_file << " was built with 64-bit point ids; "
+                          "use the RABITQ_PID64 build (bin64/) for it";
+            std::exit(1);
+        }
+        if (version != kBaseVersionWithStore)
+        {
+            LOG(ERROR) << "Unsupported base index version " << version
+                       << " (expected " << kBaseVersion << " or "
+                       << kBaseVersionWithStore << "): " << base_index_file;
+            std::exit(1);
+        }
+#endif
+        uint32_t store_u = 0;
+        uint32_t elem_u = 0;
+        input.read(reinterpret_cast<char *>(&store_u), sizeof(uint32_t));
+        input.read(reinterpret_cast<char *>(&elem_u), sizeof(uint32_t));
+        if (!input || store_u > static_cast<uint32_t>(SsdStore::Raw) ||
+            elem_u > static_cast<uint32_t>(VecElemType::U8))
+        {
+            LOG(ERROR) << "Base index has an unknown SSD store (" << store_u
+                       << ", " << elem_u << "): " << base_index_file;
+            std::exit(1);
+        }
+        ssd_store_ = static_cast<SsdStore>(store_u);
+        raw_elem_ = static_cast<VecElemType>(elem_u);
+        if (ssd_store_ == SsdStore::Raw && ex_bits_ != 0)
+        {
+            LOG(ERROR) << "Base index claims raw SSD records but ex_bits="
+                       << ex_bits_ << ": " << base_index_file;
+            std::exit(1);
+        }
+    }
+
+    template <class PendingSet>
+    inline void IVFSSD_Index<PendingSet>::check_ssd_pages(
+        const std::vector<size_t> &cluster_sizes) const
+    {
+        if (data_num_in_one_page_ == 0)
+        {
+            return;  // nothing is stored on SSD
+        }
+        size_t pages = 0;
+        for (const size_t n : cluster_sizes)
+        {
+            pages += div_round_up(n, data_num_in_one_page_) * page_num_per_io_;
+        }
+        const auto limit = static_cast<size_t>(std::numeric_limits<PageIdx>::max());
+        if (pages > limit)
+        {
+            LOG(ERROR) << "the SSD index needs " << pages << " pages, more than the "
+                       << limit << " this build can address; use the build with "
+                          "64-bit point ids (-DRABITQ_PID64=ON, bin64/)";
+            std::exit(1);
+        }
+    }
+
+    template <class PendingSet>
+    inline void IVFSSD_Index<PendingSet>::check_ssd_layout_searchable() const
+    {
+        if (ssd_store_ == SsdStore::ExBits && ex_bits_ == 0 && ssd_dim_ != 0)
+        {
+            LOG(ERROR) << "total_bits=1 with memdim " << mem_dim_ << " leaves "
+                       << ssd_dim_ << " dimensions of the 1-bit code on SSD with "
+                          "no extra-precision code, which search cannot re-rank; "
+                          "use total_bits of 2 or more, memdim "
+                       << padded_dim_ << " (the whole code in RAM), or store=raw";
+            std::exit(1);
+        }
+    }
+
+    template <class PendingSet>
+    inline void IVFSSD_Index<PendingSet>::preallocate_ssd_file(
+        uint64_t reserve_bytes)
+    {
+        if (one_data_ssd_bytes_ == 0 || num_cluster_ == 0)
+        {
+            return;
+        }
+        const size_t last = num_cluster_ - 1;
+        const uint64_t total_pages =
+            cluster_page_presums_[last] +
+            (div_round_up(cluster_lst_[last].num(), data_num_in_one_page_) *
+             page_num_per_io_);
+        const uint64_t total_bytes = total_pages * SECTOR_LEN;
+        const int fd = file_reader_->get_file_desc();
+        auto gb = [](uint64_t b) { return static_cast<double>(b) / 1e9; };
+
+        // Blocks the file already holds (a rebuild in place) need no new space.
+        struct stat st {};
+        const uint64_t held =
+            (::fstat(fd, &st) == 0) ? static_cast<uint64_t>(st.st_blocks) * 512
+                                    : 0;
+        const uint64_t need = (total_bytes > held) ? total_bytes - held : 0;
+        struct statvfs vfs {};
+        if (::fstatvfs(fd, &vfs) == 0)
+        {
+            const uint64_t avail =
+                static_cast<uint64_t>(vfs.f_bavail) * vfs.f_frsize;
+            const uint64_t want = need + reserve_bytes;
+            if (avail < want + (want / 100))
+            {
+                LOG(INFO) << "not preallocating " << ssd_index_file_ << ": it needs "
+                          << gb(need) << " GB and the build writes "
+                          << gb(reserve_bytes)
+                          << " GB of scratch on the same file system, which has "
+                          << gb(avail) << " GB free";
+                return;
+            }
+        }
+        if (::fallocate(fd, 0, 0, static_cast<off_t>(total_bytes)) == 0)
+        {
+            LOG(INFO) << "preallocated " << gb(total_bytes) << " GB for "
+                      << ssd_index_file_;
+            return;
+        }
+        LOG(INFO) << "not preallocating " << ssd_index_file_ << ": fallocate: "
+                  << std::strerror(errno);
+    }
+
+    template <class PendingSet>
     inline void IVFSSD_Index<PendingSet>::init_layout_metadata()
     {
         LOG(INFO) << "Initializing layout metadata...";
@@ -596,14 +788,33 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
 
         mem_dim_ = target_mem_dim;
+        // The 1-bit code always covers all padded_dim dimensions, and the
+        // in-memory bound's factors are computed over all of them; ssd_dim_ is
+        // the part of that code that is not memory-resident. The Raw store
+        // simply does not write it: its record is the vector itself.
         ssd_dim_ = padded_dim_ - mem_dim_;
-        empty_ssd_ = (ssd_dim_ == 0 && ex_bits_ == 0);
+        if (ssd_store_ == SsdStore::Raw)
+        {
+            empty_ssd_ = false;
+        }
+        else
+        {
+            empty_ssd_ = (ssd_dim_ == 0 && ex_bits_ == 0);
+        }
 
         LOG(INFO) << "mem_dim_ = " << mem_dim_ << "    ssd_dim_ = " << ssd_dim_;
         LOG(INFO) << "empty_ssd_=" << empty_ssd_;
 
-        one_data_ssd_bytes_ =
-            ssd_dim_ / 8 + ExDataMap<float>::data_bytes(padded_dim_, ex_bits_);
+        if (ssd_store_ == SsdStore::Raw)
+        {
+            // The input vector, zero-padded to padded_dim.
+            one_data_ssd_bytes_ = padded_dim_ * elem_type_bytes(raw_elem_);
+        }
+        else
+        {
+            one_data_ssd_bytes_ =
+                ssd_dim_ / 8 + ExDataMap<float>::data_bytes(padded_dim_, ex_bits_);
+        }
 
         if (one_data_ssd_bytes_ == 0)
         {
@@ -618,6 +829,15 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                          SECTOR_LEN / one_data_ssd_bytes_);
             page_num_per_io_ = div_round_up(one_data_ssd_bytes_, SECTOR_LEN);
         }
+    }
+
+    template <class PendingSet>
+    inline void IVFSSD_Index<PendingSet>::log_ssd_layout() const
+    {
+        LOG(INFO) << "SSD store: " << ssd_store_description() << ", "
+                  << one_data_ssd_bytes_ << " B per record, "
+                  << data_num_in_one_page_ << " per page, " << page_num_per_io_
+                  << " sector(s) per read";
     }
 
     // Allocate the coarse-quantizer-independent inverted-list buffers
@@ -763,6 +983,13 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 mem_batch_data + b * BatchDataMap<float>::data_bytes(mem_dim_);
             char *ssd_bin_data_ptr = ssd_bin_data_tmp + i * ssd_bytes_per_point;
             char *ex_data_ptr = ex_data_tmp + i * ex_bytes_per_point;
+            // A short last batch leaves factor slots unwritten; zero the block
+            // first so the base file does not depend on what memory held.
+            if (n < fastscan::kBatchSize)
+            {
+                std::memset(mem_batch_data_ptr, 0,
+                            BatchDataMap<float>::data_bytes(mem_dim_));
+            }
 
             quant::quantize_split_batch_ssd_split_single_uint64(
                 rotated_data.data() + (i * padded_dim_), rotated_centroid, n,
@@ -781,52 +1008,72 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         // fixed, contiguous, non-overlapping byte range; page p lands at
         // cluster_offset + p*write_len, an absolute offset independent of the
         // shared fd's position. So concurrent pwrite() from parallel cluster
-        // workers (or, here, parallel pages) is safe.
+        // workers (or, here, parallel chunks) is safe. Pages are written in
+        // chunks of kSsdWriteChunkPages; the bytes do not depend on the chunk
+        // size.
         const int ssd_fd = file_reader_->get_file_desc();
         const size_t write_len = SECTOR_LEN * page_num_per_io_;
         const size_t num_pages = div_round_up(num_points, data_num_in_one_page_);
+        const size_t pages_per_chunk =
+            std::max<size_t>(1, kSsdWriteChunkPages / page_num_per_io_);
+        const size_t num_chunks = div_round_up(num_pages, pages_per_chunk);
 
 #pragma omp parallel for schedule(static) if (batch_parallel)
-        for (size_t p = 0; p < num_pages; ++p)
+        for (size_t ch = 0; ch < num_chunks; ++ch)
         {
-            const size_t pid = p * data_num_in_one_page_;
-            const size_t points_in_page =
-                std::min(data_num_in_one_page_, num_points - pid);
-            const size_t page_offset = cluster_offset + p * write_len;
+            const size_t first_page = ch * pages_per_chunk;
+            const size_t pages_here =
+                std::min(pages_per_chunk, num_pages - first_page);
+            const size_t chunk_len = pages_here * write_len;
+            const size_t page_offset = cluster_offset + first_page * write_len;
 
             char *page_buf =
-                memory::align_allocate<SECTOR_LEN, char, true>(write_len);
-            // Zero the page so the trailing padding (the bytes after the last
+                memory::align_allocate<SECTOR_LEN, char, true>(chunk_len);
+            // Zero the chunk so the trailing padding (the bytes after the last
             // point in this cluster's final page, plus any intra-sector slack)
             // is deterministic; align_allocate does not zero. The padding is
             // never read at query time, but zeroing keeps the on-disk SSD file
             // reproducible and makes the streaming and full-DRAM builds
             // bit-identical.
-            std::memset(page_buf, 0, write_len);
+            std::memset(page_buf, 0, chunk_len);
 
-            char *buf_ptr = page_buf;
-            for (size_t i = 0; i < points_in_page; ++i)
+            for (size_t q = 0; q < pages_here; ++q)
             {
-                std::memcpy(buf_ptr,
-                            ssd_bin_data_tmp + (pid + i) * (ssd_dim_ / 8),
-                            ssd_dim_ / 8);
-                buf_ptr += ssd_dim_ / 8;
+                const size_t pid = (first_page + q) * data_num_in_one_page_;
+                const size_t points_in_page =
+                    std::min(data_num_in_one_page_, num_points - pid);
+                char *buf_ptr = page_buf + q * write_len;
+                for (size_t i = 0; i < points_in_page; ++i)
+                {
+                    if (ssd_store_ == SsdStore::Raw)
+                    {
+                        // fetch_row(k) is the k-th point in stored order, the
+                        // same order as cp.ids(), before any rotation.
+                        write_raw_record(buf_ptr, fetch_row(pid + i));
+                        buf_ptr += one_data_ssd_bytes_;
+                        continue;
+                    }
+                    std::memcpy(buf_ptr,
+                                ssd_bin_data_tmp + (pid + i) * (ssd_dim_ / 8),
+                                ssd_dim_ / 8);
+                    buf_ptr += ssd_dim_ / 8;
 
-                const size_t ex_bytes =
-                    ExDataMap<float>::data_bytes(padded_dim_, ex_bits_);
-                std::memcpy(buf_ptr,
-                            ex_data_tmp + (pid + i) * ex_bytes, ex_bytes);
-                buf_ptr += ex_bytes;
+                    const size_t ex_bytes =
+                        ExDataMap<float>::data_bytes(padded_dim_, ex_bits_);
+                    std::memcpy(buf_ptr,
+                                ex_data_tmp + (pid + i) * ex_bytes, ex_bytes);
+                    buf_ptr += ex_bytes;
+                }
             }
 
             // Retry loop guards against short writes. The file is O_DIRECT,
             // so any partial write still lands on a SECTOR_LEN boundary,
             // keeping buffer / offset / length aligned for the next pwrite.
             size_t written = 0;
-            while (written < write_len)
+            while (written < chunk_len)
             {
                 const ssize_t n = ::pwrite(
-                    ssd_fd, page_buf + written, write_len - written,
+                    ssd_fd, page_buf + written, chunk_len - written,
                     static_cast<off_t>(page_offset + written));
                 if (n <= 0)
                 {
@@ -963,17 +1210,18 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     // persist them for the coarse build to reuse.
     template <class PendingSet>
     inline void IVFSSD_Index<PendingSet>::construct_invlist(
-        const float *data, const float *centroids, const PID *assignments,
+        const float *data, const float *centroids, const CID *assignments,
         bool faster, ClusterOrderMode order_mode)
     {
         LOG(INFO) << "Constructing inverted list (split-storage base)...";
+        check_ssd_layout_searchable();
 
         LOG(INFO) << "Loading clustering information...";
         std::vector<size_t> counts(num_cluster_, 0);
         std::vector<std::vector<PID>> id_lists(num_cluster_);
         for (size_t i = 0; i < num_; ++i)
         {
-            const PID cid = assignments[i];
+            const CID cid = assignments[i];
             if (cid >= num_cluster_)
             {
                 LOG(ERROR) << "Bad cluster id";
@@ -983,11 +1231,15 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             counts[cid] += 1;
         }
 
+        check_ssd_pages(counts);
         allocate_invlist_memory(counts);
         init_clusters(counts);
 
         file_reader_ = std::make_shared<LinuxAlignedFileReader>();
         file_reader_->open(ssd_index_file_, true, true);
+#if defined(RABITQ_PID64)
+        preallocate_ssd_file(0);
+#endif
 
         // Held as a member rather than a local so save_base can persist it;
         // the coarse quantizer is built from this block later.
@@ -1049,16 +1301,25 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     template <class PendingSet>
     inline void IVFSSD_Index<PendingSet>::construct_invlist_streaming(
         const std::string &data_file, const float *centroids,
-        const PID *assignments, bool faster, ClusterOrderMode order_mode,
-        size_t mem_budget_bytes)
+        const CID *assignments, bool faster, ClusterOrderMode order_mode,
+        size_t mem_budget_bytes, size_t prefix_rows)
     {
         namespace fs = std::filesystem;
+        check_ssd_layout_searchable();
         LOG(INFO) << "Constructing inverted list (streaming, mem_budget="
                   << (mem_budget_bytes >> 30) << " GiB)...";
 
         constexpr uint32_t kNoFile = std::numeric_limits<uint32_t>::max();
         const size_t T =
             static_cast<size_t>(std::max(1, omp_get_max_threads()));
+
+        // Reorder-scratch metadata, one record per row: the point id and its
+        // cluster id.
+        struct ReorderMeta
+        {
+            PID pid;
+            CID cid;
+        };
 
         // Per-phase wall-clock timers (P0 setup / P1 reorder / P2 quantize)
         // plus a total for construct_invlist_streaming itself; all are
@@ -1111,7 +1372,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         std::vector<size_t> counts(num_cluster_, 0);
         for (size_t i = 0; i < num_; ++i)
         {
-            const PID cid = assignments[i];
+            const CID cid = assignments[i];
             if (cid >= num_cluster_)
             {
                 LOG(ERROR) << "Bad cluster id " << cid << " at point " << i;
@@ -1120,6 +1381,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             counts[cid] += 1;
         }
 
+        check_ssd_pages(counts);
         allocate_invlist_memory(counts);
         init_clusters(counts);
 
@@ -1154,7 +1416,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             mem_batch_data_bytes(counts) + ids_bytes() +
             (num_cluster_ * padded_dim_ * sizeof(float)) +  // rotated centroids
             (num_cluster_ * dim_ * sizeof(float)) +         // raw centroids
-            (num_ * sizeof(PID));                           // assignments
+            (num_ * sizeof(CID));                           // assignments
         const double b_total = 0.85 * static_cast<double>(mem_budget_bytes);
         if (b_total <= static_cast<double>(r_res))
         {
@@ -1277,6 +1539,36 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                   << " | small_groups=" << n_small_groups << " big=" << n_big
                   << " files=" << num_files;
 
+        // The data file decides the scratch row width. The reorder pass only
+        // permutes rows, so it keeps the stored values -- one byte each for
+        // uint8 input, four for float32 -- and P2 widens a group to float32 as
+        // it loads it.
+        StreamingRowReader reader(data_file);
+        if (prefix_rows != 0)
+        {
+            if (prefix_rows > reader.rows())
+            {
+                LOG(ERROR) << "streaming build: asked for the first "
+                           << prefix_rows << " rows of " << data_file
+                           << ", which holds only " << reader.rows();
+                std::exit(1);
+            }
+            reader.limit_rows(prefix_rows);
+            LOG(INFO) << "streaming build: indexing the first " << prefix_rows
+                      << " of " << reader.file_rows() << " rows of " << data_file;
+        }
+        if (reader.rows() != num_ || reader.cols() != dim_)
+        {
+            LOG(ERROR) << "streaming build: data_file shape (" << reader.rows()
+                       << "x" << reader.cols() << ") != index (" << num_ << "x"
+                       << dim_ << ")";
+            std::exit(1);
+        }
+        const size_t scratch_row_bytes = dim_ * reader.elem_bytes();
+        LOG(INFO) << "streaming build: input values are "
+                  << elem_type_name(reader.elem_type()) << ", "
+                  << scratch_row_bytes << " B per row in the reorder scratch";
+
         // ---- P0d: scratch dir --------------------------------------------
         // The reorder pass writes every vector once, so this directory grows to
         // the size of the dataset before P2 consumes and P3 removes it. It sits
@@ -1295,7 +1587,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
         // Fail now rather than partway through a multi-hour reorder pass.
         {
-            const size_t need = num_ * dim_ * sizeof(float) + num_ * 2 * sizeof(uint32_t);
+            const size_t need = num_ * scratch_row_bytes + num_ * sizeof(ReorderMeta);
             fs::create_directories(scratch_parent, ec);
             const fs::space_info si = fs::space(scratch_parent, ec);
             if (!ec && si.available < need)
@@ -1317,6 +1609,20 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                        << scratch_dir << ": " << ec.message();
             std::exit(1);
         }
+#if defined(RABITQ_PID64)
+        {
+            // The scratch fills before the SSD file does, so preallocation
+            // must leave room for it when both share a file system.
+            struct stat scratch_st {};
+            struct stat ssd_st {};
+            const bool same_fs =
+                ::stat(scratch_dir.c_str(), &scratch_st) == 0 &&
+                ::fstat(file_reader_->get_file_desc(), &ssd_st) == 0 &&
+                scratch_st.st_dev == ssd_st.st_dev;
+            preallocate_ssd_file(
+                same_fs ? num_ * (scratch_row_bytes + sizeof(ReorderMeta)) : 0);
+        }
+#endif
         auto vec_path = [&](size_t f) {
             return (scratch_dir / ("g" + std::to_string(f) + ".vec")).string();
         };
@@ -1329,15 +1635,6 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         phase_sw.reset();
 
         // ---- P1: streaming reorder pass -----------------------------------
-        StreamingRowReader reader(data_file);
-        if (reader.rows() != num_ || reader.cols() != dim_)
-        {
-            LOG(ERROR) << "streaming build: data_file shape (" << reader.rows()
-                       << "x" << reader.cols() << ") != index (" << num_ << "x"
-                       << dim_ << ")";
-            std::exit(1);
-        }
-
         std::vector<int> vec_fd(num_files, -1), meta_fd(num_files, -1);
         for (size_t f = 0; f < num_files; ++f)
         {
@@ -1353,11 +1650,10 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 std::exit(1);
             }
             if (::ftruncate(vec_fd[f], static_cast<off_t>(
-                                           file_rows[f] * dim_ *
-                                           sizeof(float))) != 0 ||
+                                           file_rows[f] * scratch_row_bytes)) != 0 ||
                 ::ftruncate(meta_fd[f], static_cast<off_t>(
-                                            file_rows[f] * 2 *
-                                            sizeof(uint32_t))) != 0)
+                                            file_rows[f] *
+                                            sizeof(ReorderMeta))) != 0)
             {
                 LOG(ERROR) << "streaming build: ftruncate failed: "
                            << std::strerror(errno);
@@ -1370,22 +1666,22 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         size_t block_bytes = b_trans / 8;
         const size_t cap = static_cast<size_t>(8) << 30;
         if (block_bytes > cap) block_bytes = cap;
-        size_t BN = block_bytes / (dim_ * sizeof(float));
+        size_t BN = block_bytes / scratch_row_bytes;
         if (BN < 1) BN = 1;
         if (BN > num_) BN = num_;
 
-        float *block_buf =
-            memory::align_allocate<64, float, true>(BN * dim_ * sizeof(float));
-        float *stage_vec =
-            memory::align_allocate<64, float, true>(BN * dim_ * sizeof(float));
-        std::vector<uint32_t> stage_meta(BN * 2);
+        char *block_buf =
+            memory::align_allocate<64, char, true>(BN * scratch_row_bytes);
+        char *stage_vec =
+            memory::align_allocate<64, char, true>(BN * scratch_row_bytes);
+        std::vector<ReorderMeta> stage_meta(BN);
         std::vector<size_t> pos(BN);
         std::vector<size_t> file_cursor(num_files, 0);
 
         for (size_t i0 = 0; i0 < num_; i0 += BN)
         {
             const size_t bn = std::min(BN, num_ - i0);
-            reader.read_rows(i0, bn, block_buf);
+            reader.read_rows_raw(i0, bn, block_buf);
 
             std::vector<size_t> bcnt(num_files, 0);
             for (size_t r = 0; r < bn; ++r)
@@ -1418,26 +1714,26 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 const size_t local = stage_off[f] + fill[f];
                 fill[f] += 1;
                 pos[r] = local;
-                stage_meta[local * 2] = static_cast<uint32_t>(i0 + r);  // pid
-                stage_meta[local * 2 + 1] = c;                          // cid
+                stage_meta[local].pid = static_cast<PID>(i0 + r);
+                stage_meta[local].cid = c;
             }
 #pragma omp parallel for schedule(static)
             for (size_t r = 0; r < bn; ++r)
             {
                 if (pos[r] == std::numeric_limits<size_t>::max()) continue;
-                std::memcpy(stage_vec + pos[r] * dim_, block_buf + r * dim_,
-                            dim_ * sizeof(float));
+                std::memcpy(stage_vec + pos[r] * scratch_row_bytes,
+                            block_buf + r * scratch_row_bytes, scratch_row_bytes);
             }
 #pragma omp parallel for schedule(dynamic, 1)
             for (size_t f = 0; f < num_files; ++f)
             {
                 if (bcnt[f] == 0) continue;
-                pwrite_full(vec_fd[f], stage_vec + stage_off[f] * dim_,
-                            bcnt[f] * dim_ * sizeof(float),
-                            static_cast<off_t>(base[f] * dim_ * sizeof(float)));
-                pwrite_full(meta_fd[f], stage_meta.data() + stage_off[f] * 2,
-                            bcnt[f] * 2 * sizeof(uint32_t),
-                            static_cast<off_t>(base[f] * 2 * sizeof(uint32_t)));
+                pwrite_full(vec_fd[f], stage_vec + stage_off[f] * scratch_row_bytes,
+                            bcnt[f] * scratch_row_bytes,
+                            static_cast<off_t>(base[f] * scratch_row_bytes));
+                pwrite_full(meta_fd[f], stage_meta.data() + stage_off[f],
+                            bcnt[f] * sizeof(ReorderMeta),
+                            static_cast<off_t>(base[f] * sizeof(ReorderMeta)));
             }
         }
         for (size_t f = 0; f < num_files; ++f)
@@ -1447,7 +1743,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
         std::free(block_buf);
         std::free(stage_vec);
-        std::vector<uint32_t>().swap(stage_meta);
+        std::vector<ReorderMeta>().swap(stage_meta);
         std::vector<size_t>().swap(pos);
         LOG(INFO) << "streaming build: reorder pass complete (" << num_files
                   << " files)";
@@ -1471,9 +1767,30 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             }
             float *gbuf = memory::align_allocate<64, float, true>(
                 n * dim_ * sizeof(float));
-            std::vector<uint32_t> meta(n * 2);
-            pread_full(vfd, gbuf, n * dim_ * sizeof(float), 0);
-            pread_full(mfd, meta.data(), n * 2 * sizeof(uint32_t), 0);
+            std::vector<ReorderMeta> meta(n);
+            if (scratch_row_bytes == dim_ * sizeof(float))
+            {
+                pread_full(vfd, gbuf, n * dim_ * sizeof(float), 0);
+            }
+            else
+            {
+                // uint8 scratch: widen to float32 while reading, a bounded
+                // chunk at a time, so the group needs no second full-size
+                // buffer. The widening is exact.
+                const size_t total = n * dim_;
+                const size_t chunk = std::min(total, static_cast<size_t>(1) << 26);
+                std::vector<uint8_t> u8(chunk);
+                for (size_t off = 0; off < total; off += chunk)
+                {
+                    const size_t len = std::min(chunk, total - off);
+                    pread_full(vfd, u8.data(), len, static_cast<off_t>(off));
+                    for (size_t t = 0; t < len; ++t)
+                    {
+                        gbuf[off + t] = static_cast<float>(u8[t]);
+                    }
+                }
+            }
+            pread_full(mfd, meta.data(), n * sizeof(ReorderMeta), 0);
             ::close(vfd);
             ::close(mfd);
 
@@ -1493,8 +1810,8 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 std::vector<std::vector<PID>> loc_pids(clusters.size());
                 for (size_t r = 0; r < n; ++r)
                 {
-                    const uint32_t pid = meta[r * 2];
-                    const uint32_t c = meta[r * 2 + 1];
+                    const PID pid = meta[r].pid;
+                    const CID c = meta[r].cid;
                     const uint32_t k = cpos[c];
                     loc_rows[k].push_back(static_cast<uint32_t>(r));
                     loc_pids[k].push_back(pid);
@@ -1551,7 +1868,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 float *rc = &rotated_centroids_[c * padded_dim_];
                 const size_t coff = cluster_page_presums_[c] * SECTOR_LEN;
                 std::vector<PID> pids(n);
-                for (size_t r = 0; r < n; ++r) pids[r] = meta[r * 2];
+                for (size_t r = 0; r < n; ++r) pids[r] = meta[r].pid;
 
                 if (order_mode == ClusterOrderMode::OrderedByCentroidDistance)
                 {
@@ -1619,8 +1936,17 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             std::exit(1);
         }
 
+        // An ExBits index stays at version 1, byte for byte; only the Raw
+        // store needs the version-2 fields. The 64-bit point-id build always
+        // writes version 3.
         const uint32_t magic = kBaseMagic;
-        const uint32_t version = kBaseVersion;
+#if defined(RABITQ_PID64)
+        const uint32_t version = kBaseVersionPid64;
+#else
+        const uint32_t version = (ssd_store_ == SsdStore::ExBits)
+                                     ? kBaseVersion
+                                     : kBaseVersionWithStore;
+#endif
         output.write(reinterpret_cast<const char *>(&magic), sizeof(uint32_t));
         output.write(reinterpret_cast<const char *>(&version), sizeof(uint32_t));
 
@@ -1631,6 +1957,13 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         output.write(reinterpret_cast<const char *>(&type_), sizeof(type_));
         output.write(reinterpret_cast<const char *>(&metric_type_),
                      sizeof(metric_type_));
+        if (version != kBaseVersion)
+        {
+            const auto store_u = static_cast<uint32_t>(ssd_store_);
+            const auto elem_u = static_cast<uint32_t>(raw_elem_);
+            output.write(reinterpret_cast<const char *>(&store_u), sizeof(uint32_t));
+            output.write(reinterpret_cast<const char *>(&elem_u), sizeof(uint32_t));
+        }
 
         std::vector<size_t> cluster_sizes;
         cluster_sizes.reserve(num_cluster_);
@@ -1683,12 +2016,6 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                        << base_index_file;
             std::exit(1);
         }
-        if (version != kBaseVersion)
-        {
-            LOG(ERROR) << "Unsupported base index version " << version
-                       << " (expected " << kBaseVersion << ")";
-            std::exit(1);
-        }
 
         input.read(reinterpret_cast<char *>(&num_), sizeof(size_t));
         input.read(reinterpret_cast<char *>(&dim_), sizeof(size_t));
@@ -1697,6 +2024,9 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         input.read(reinterpret_cast<char *>(&type_), sizeof(type_));
         input.read(reinterpret_cast<char *>(&metric_type_),
                    sizeof(metric_type_));
+        // build_coarse ignores the SSD store, but its fields sit before the
+        // rotator, so they are read to stay aligned.
+        read_base_store_fields(input, version, base_index_file);
 
         rotator_ =
             choose_rotator<float>(dim_, type_, round_up_to_multiple(dim_, 64));
@@ -1840,12 +2170,6 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                        << base_index_file;
             std::exit(1);
         }
-        if (version != kBaseVersion)
-        {
-            LOG(ERROR) << "Unsupported base index version " << version
-                       << " (expected " << kBaseVersion << ")";
-            std::exit(1);
-        }
 
         input.read(reinterpret_cast<char *>(&num_), sizeof(size_t));
         input.read(reinterpret_cast<char *>(&dim_), sizeof(size_t));
@@ -1853,6 +2177,9 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         input.read(reinterpret_cast<char *>(&ex_bits_), sizeof(size_t));
         input.read(reinterpret_cast<char *>(&type_), sizeof(type_));
         input.read(reinterpret_cast<char *>(&metric_type_), sizeof(metric_type_));
+        // The SSD store must be known before init_layout_metadata below: it
+        // decides the record size and hence the page layout.
+        read_base_store_fields(input, version, base_index_file);
 
         requested_mem_dim_ = mem_dim;
 
@@ -1860,6 +2187,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             choose_rotator<float>(dim_, type_, round_up_to_multiple(dim_, 64));
         padded_dim_ = rotator_->size();
         init_layout_metadata();
+        log_ssd_layout();
 
         std::vector<size_t> cluster_sizes(num_cluster_, 0);
         input.read(reinterpret_cast<char *>(cluster_sizes.data()),
@@ -1873,6 +2201,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             LOG(ERROR) << "The sum of cluster sizes != total number of points";
             std::exit(1);
         }
+        check_ssd_pages(cluster_sizes);
 
         rotator_->load(input);
 
@@ -2011,6 +2340,10 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     {
         buf.rotated_query =
             memory::align_allocate<64, float, true>(padded_dim_ * sizeof(float));
+        buf.raw_query =
+            (ssd_store_ == SsdStore::Raw)
+                ? memory::align_allocate<64, float, true>(padded_dim_ * sizeof(float))
+                : nullptr;
         buf.request_slot_bytes = page_num_per_io_ * SECTOR_LEN;
         buf.sector_scratch = memory::align_allocate<SECTOR_LEN, char, true>(
             N_REQ_BUF * buf.request_slot_bytes);
@@ -2111,6 +2444,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         {
             QueryBuffer *buf = thread_data_bufs_.back();
             std::free(buf->rotated_query);
+            std::free(buf->raw_query);
             std::free(buf->sector_scratch);
             thread_data_bufs_.pop_back();
             delete buf;
@@ -2125,15 +2459,15 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
     template <class PendingSet>
     inline void IVFSSD_Index<PendingSet>::init_cluster_scan_state(
-        const ivf::Cluster &cur_cluster, PID cid, ClusterScanState &state)
+        const ivf::Cluster &cur_cluster, CID cid, ClusterScanState &state)
     {
         // Page-id tracking advances for every point in the cluster, regardless
         // of whether that point survives the mem-level prune. Only candidate
         // insertion is conditional on low_distance <= distk.
         state.last_page = -1;
-        state.cur_page_slot_id = kPidMax;
+        state.cur_page_slot_id = kSlotMax;
         state.cur_inner_pid = -1;
-        state.cur_page = static_cast<int>(cluster_page_presums_[cid]);
+        state.cur_page = static_cast<PageIdx>(cluster_page_presums_[cid]);
         state.in_page_idx = 0;
         state.remaining_in_page = static_cast<int>(data_num_in_one_page_);
         state.mem_data = cur_cluster.batch_data();
@@ -2176,7 +2510,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 state.remaining_in_page = data_num_in_one_page;
                 state.in_page_idx = 0;
             }
-            const int cur_page_id = state.cur_page;
+            const PageIdx cur_page_id = state.cur_page;
             const int cur_in_page_idx = state.in_page_idx;
             --state.remaining_in_page;
             ++state.in_page_idx;
@@ -2209,7 +2543,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
                 PageCandidates &page_cand =
                     query_buf->page_slots[state.cur_page_slot_id];
-                page_cand.probe_idx = static_cast<PID>(probe_idx);
+                page_cand.probe_idx = static_cast<CID>(probe_idx);
                 page_cand.page_id = cur_page_id;
                 page_cand.candidate_num = 0;
                 page_cand.page_lower_bound = query_buf->low_distance[idx];
@@ -2278,6 +2612,13 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         void *ctx = file_reader_->get_ctx();
 
         rotator_->rotate(query, query_buf->rotated_query);
+        if (ssd_store_ == SsdStore::Raw)
+        {
+            // Raw records are compared with the query as given.
+            std::memcpy(query_buf->raw_query, query, dim_ * sizeof(float));
+            std::fill(query_buf->raw_query + dim_,
+                      query_buf->raw_query + padded_dim_, 0.0F);
+        }
 
         auto &centroid_dist = query_buf->centroid_dist;
         centroid_dist.resize(nprobe);
@@ -2314,7 +2655,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
         for (size_t i = 0; i < nprobe; ++i)
         {
-            const PID cid = centroid_dist[i].id;
+            const CID cid = static_cast<CID>(centroid_dist[i].id);
             const float dist = centroid_dist[i].distance;
             const ivf::Cluster &cur_cluster = cluster_lst_[cid];
             if (stats != nullptr)
@@ -2403,7 +2744,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                         empty_ssd_);
                     for (int j = 0; j < n_completed; ++j)
                     {
-                        const PID slot_id = query_buf->completed_slots[j];
+                        const SlotID slot_id = query_buf->completed_slots[j];
                         complete_distance_for_page_candidate(
                             slot_id, query_buf, io_queue, q_obj, knns, stats);
                     }
@@ -2447,7 +2788,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 file_reader_.get(), ctx, query_buf, n_completed, empty_ssd_);
             for (int j = 0; j < n_completed; ++j)
             {
-                const PID slot_id = query_buf->completed_slots[j];
+                const SlotID slot_id = query_buf->completed_slots[j];
                 complete_distance_for_page_candidate(slot_id, query_buf,
                                                      io_queue, q_obj, knns,
                                                      stats);
@@ -2569,7 +2910,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     template <class PendingSet>
     inline void IVFSSD_Index<PendingSet>::push_pagecand_into_candidate_pool(
         QueryBuffer *query_buf, PageCandidate_IO_Queue<PendingSet> *io_queue,
-        PID slot_id, SearchStats *stats)
+        SlotID slot_id, SearchStats *stats)
     {
         PageCandidates &page_cand = query_buf->page_slots[slot_id];
         io_queue->push_into_submit_candidate_pool(slot_id,
@@ -2579,7 +2920,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
     template <class PendingSet>
     inline void IVFSSD_Index<PendingSet>::complete_distance_for_page_candidate(
-        PID slot_id, QueryBuffer *query_buf,
+        SlotID slot_id, QueryBuffer *query_buf,
         PageCandidate_IO_Queue<PendingSet> *io_queue,
         const SplitBatchQuery_nprobe<float> &q_obj,
         buffer::SearchBuffer<float> &knns, SearchStats *stats)
@@ -2607,7 +2948,52 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         // submission upstream.
         float distk = knns.top_dist();
 
-        if (ex_bits_ == 0 && ssd_dim_ == 0)
+        if (ssd_store_ == SsdStore::Raw)
+        {
+            // Raw records: the exact distance to the unrotated query, on the
+            // scale the in-memory estimator uses (squared L2, or 1 - <q, o>
+            // for inner product). The rotation is orthonormal, so the
+            // in-memory lower bound still bounds this distance and the cheap
+            // early exit is kept. Records and query are both zero-padded to
+            // padded_dim, which leaves the distance unchanged.
+            const float *rq = query_buf->raw_query;
+            const bool l2 = (metric_type_ == METRIC_L2);
+            const bool u8 = (raw_elem_ == VecElemType::U8);
+            const SingleCandidate *slot_candidates =
+                query_buf->slot_candidates(slot_id);
+            for (size_t cidx = 0; cidx < page_cand.candidate_num; ++cidx)
+            {
+                const SingleCandidate &cand = slot_candidates[cidx];
+                if (cand.mem_low_dist_ > distk)
+                {
+                    continue;
+                }
+                const char *rec = data + cand.in_page_idx * one_data_ssd_bytes_;
+                float full_dist = 0.0F;
+                if (u8)
+                {
+                    const auto *v = reinterpret_cast<const uint8_t *>(rec);
+                    full_dist = l2 ? l2sqr_f32_u8(rq, v, padded_dim_)
+                                   : 1.0F - ip_f32_u8(rq, v, padded_dim_);
+                }
+                else
+                {
+                    const auto *v = reinterpret_cast<const float *>(rec);
+                    full_dist = l2 ? euclidean_sqr<float>(rq, v, padded_dim_)
+                                   : dot_product_dis<float>(rq, v, padded_dim_);
+                }
+                ++boost_dists;
+
+                if (full_dist > distk)
+                {
+                    continue;
+                }
+                knns.insert(cand.true_data_id, full_dist);
+                ++knn_inserts;
+                distk = knns.top_dist();
+            }
+        }
+        else if (ex_bits_ == 0 && ssd_dim_ == 0)
         {
             const SingleCandidate *slot_candidates =
                 query_buf->slot_candidates(slot_id);

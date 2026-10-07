@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstdint>
 #include <limits>
 
 #include "rabitqlib/third/Eigen/Dense"
@@ -9,9 +10,21 @@
 
 namespace rabitqlib {
 
+// Integer ids by role. A point id indexes the base vectors; it is 32-bit unless
+// the build is configured with RABITQ_PID64=ON, which widens it to 64 bits for
+// datasets with more than 2^32 - 1 points. Cluster ids and per-query page-slot
+// ids are 32-bit in every build, so the coarse-quantizer files are the same in
+// both builds.
+#if defined(RABITQ_PID64)
+using PID = uint64_t;
+#else
 using PID = uint32_t;
+#endif
+using CID = uint32_t;
+using SlotID = uint32_t;
 
-constexpr uint32_t kPidMax = 0xFFFFFFFF;
+constexpr PID kPidMax = std::numeric_limits<PID>::max();
+constexpr SlotID kSlotMax = std::numeric_limits<SlotID>::max();
 
 template <typename T>
 using RowMajorMatrix = Eigen::Matrix<T, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>;

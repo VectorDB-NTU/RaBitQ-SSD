@@ -16,6 +16,7 @@
 #include <limits>
 #include <memory>
 #include <numeric>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -31,6 +32,7 @@
 #include "rabitqlib/ssd_utils/concurrent_queue.hpp"
 #include "rabitqlib/ssd_utils/linux_aligned_file_reader.hpp"
 #include "rabitqlib/utils/buffer.hpp"
+#include "rabitqlib/utils/io_auto.hpp"
 #include "rabitqlib/utils/memory.hpp"
 #include "rabitqlib/utils/rotator.hpp"
 #include "rabitqlib/utils/space.hpp"
@@ -46,6 +48,23 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         Flat = 0,
         HNSW = 1,
         IRQ = 2,
+    };
+
+    // What one SSD record holds. Chosen when build_invlist runs and saved in
+    // <base>, so querying reads it from the index rather than a flag.
+    //   ExBits -> the 1-bit code of the dimensions past MEMDIM plus the
+    //             extra-precision code (B-1 bits per dimension). Re-ranking
+    //             estimates the distance from the codes. The default, and the
+    //             configuration of the paper's main evaluation.
+    //   Raw    -> the vector exactly as build_invlist read it, float32 or
+    //             uint8, zero-padded to padded_dim. Re-ranking computes the
+    //             exact distance to the unrotated query. The in-memory prefix
+    //             and its bounds are the same as for ExBits, so the scan,
+    //             pruning and I/O pipeline are shared unchanged.
+    enum class SsdStore : uint8_t
+    {
+        ExBits = 0,
+        Raw = 1,
     };
 
     // Cluster scan is batched: for each 32-point batch the scan refreshes
@@ -89,8 +108,17 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     //                 <coarse>.hnsw sidecar via the initializer's own save().
     //
     // Querying loads one <base> (+ <base>.ssd) plus one <coarse>.
+    //
+    // <base> versions. Version 1 is the ExBits layout, and every ExBits index
+    // is still written as version 1, so its bytes never change. Version 2
+    // inserts two uint32 fields after the metric -- the SsdStore and the
+    // VecElemType of raw records -- and is written only for the Raw store.
+    // Version 3 has the version-2 header and 64-bit point ids; only the
+    // RABITQ_PID64 build writes it, and each build reads only its own ids.
     constexpr uint32_t kBaseMagic = 0x52424253U;   // 'RBBS' (rabitq base split)
     constexpr uint32_t kBaseVersion = 1U;
+    constexpr uint32_t kBaseVersionWithStore = 2U;
+    constexpr uint32_t kBaseVersionPid64 = 3U;
     constexpr uint32_t kCoarseMagic = 0x52424351U; // 'RBCQ' (rabitq coarse q)
     constexpr uint32_t kCoarseVersion = 1U;
 
@@ -235,7 +263,8 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         //                              2*ex_bits*padded_dim + 6 flop-eq).
         //                              0 on the ex_bits_==0 && ssd_dim_==0 path
         //                              (no boosting: mem_est_dist_ used
-        //                              directly).
+        //                              directly). With the Raw store it counts
+        //                              exact distance evaluations instead.
         //   main_knn_inserts         : # knns.insert calls (records that also
         //                              passed the final full_dist <= distk).
         // Useful ratios: boost_dists/records_examined = mem lower-bound prune
@@ -296,6 +325,15 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
     };
 
+    // Global page index into <base>.ssd. int covers 2^31 - 1 pages (8 TiB),
+    // and check_ssd_pages refuses a larger layout at build and load; the
+    // 64-bit point-id build, meant for larger indexes, widens it.
+#if defined(RABITQ_PID64)
+    using PageIdx = int64_t;
+#else
+    using PageIdx = int;
+#endif
+
     struct SingleCandidate
     {
         PID true_data_id;
@@ -308,8 +346,8 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     struct PageCandidates
     {
         float page_lower_bound = 0.0F;
-        PID probe_idx = static_cast<PID>(-1);
-        int page_id = -1;
+        CID probe_idx = static_cast<CID>(-1);
+        PageIdx page_id = -1;
         int req_slot = -1;
 
         uint16_t candidate_num = 0;
@@ -318,6 +356,11 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     struct QueryBuffer
     {
         float *rotated_query = nullptr;
+        // Raw store only (nullptr otherwise): the query as given, zero-padded
+        // to padded_dim. Raw records are unrotated, so they are compared with
+        // the unrotated query; the rotation is orthonormal, so the in-memory
+        // bounds computed in rotated space still bound these distances.
+        float *raw_query = nullptr;
         char *sector_scratch = nullptr;
 
         std::vector<float> est_distance;
@@ -329,12 +372,12 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         std::vector<AnnCandidate<float>> centroid_dist;
 
         std::array<IORequest, N_REQ_BUF> reqs{};
-        std::array<PID, N_REQ_BUF> req_slot_owner{};
-        std::vector<PID> completed_slots;
+        std::array<SlotID, N_REQ_BUF> req_slot_owner{};
+        std::vector<SlotID> completed_slots;
 
         std::vector<PageCandidates> page_slots;
         std::vector<SingleCandidate> candidate_storage;
-        std::vector<PID> free_page_slots;
+        std::vector<SlotID> free_page_slots;
         std::vector<int> free_req_slots;
 
         void init_page_candidate_storage(size_t candidate_capacity,
@@ -342,8 +385,8 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         void ensure_page_slot_capacity(size_t target_slots);
         void reset();
         [[nodiscard]] char *request_buffer(int req_slot) const;
-        [[nodiscard]] SingleCandidate *slot_candidates(PID slot_id);
-        [[nodiscard]] const SingleCandidate *slot_candidates(PID slot_id) const;
+        [[nodiscard]] SingleCandidate *slot_candidates(SlotID slot_id);
+        [[nodiscard]] const SingleCandidate *slot_candidates(SlotID slot_id) const;
     };
 
     class ArrayPendingSet
@@ -351,7 +394,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     public:
         struct Entry
         {
-            PID slot_id = kPidMax;
+            SlotID slot_id = kSlotMax;
             float key = 0.0F;
         };
 
@@ -359,10 +402,10 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         void on_slot_grow(size_t new_slot_count);
         [[nodiscard]] bool empty() const;
         [[nodiscard]] size_t size() const;
-        void insert(PID slot_id, float key);
-        [[nodiscard]] PID front_slot() const;
+        void insert(SlotID slot_id, float key);
+        [[nodiscard]] SlotID front_slot() const;
         void pop_front();
-        void prune_greater(float distk, std::vector<PID> &pruned_slots);
+        void prune_greater(float distk, std::vector<SlotID> &pruned_slots);
 
     private:
         void compact_if_needed();
@@ -382,9 +425,9 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         {
             return pending_.empty() && inflight_count_ == 0 && ready_completed_.empty();
         }
-        PID acquire_page_candidate_slot(QueryBuffer *query_buf);
+        SlotID acquire_page_candidate_slot(QueryBuffer *query_buf);
 
-        int push_into_submit_candidate_pool(PID slot_id, float page_lower_bound,
+        int push_into_submit_candidate_pool(SlotID slot_id, float page_lower_bound,
                                             SearchStats *stats = nullptr);
 
         int submit_top_io_pagecandidates(size_t max_n_page_submit,
@@ -401,8 +444,8 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             SearchStats *stats = nullptr);
 
         [[nodiscard]] const char *completed_data(const QueryBuffer *query_buf,
-                                                 PID slot_id) const;
-        void release_completed_slot(QueryBuffer *query_buf, PID slot_id);
+                                                 SlotID slot_id) const;
+        void release_completed_slot(QueryBuffer *query_buf, SlotID slot_id);
 
     private:
         static constexpr int kInvalidReqSlot = -1;
@@ -413,9 +456,9 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         static constexpr uint8_t kStateCompleted = 4;
 
         void ensure_slot_capacity(size_t target_slots);
-        void release_page_slot(QueryBuffer *query_buf, PID slot_id);
+        void release_page_slot(QueryBuffer *query_buf, SlotID slot_id);
         void prune_pending_above(QueryBuffer *query_buf, float distk);
-        void prepare_request(QueryBuffer *query_buf, PID slot_id, int req_slot);
+        void prepare_request(QueryBuffer *query_buf, SlotID slot_id, int req_slot);
 
         template <bool LimitByCandidateCount>
         int submit_impl(size_t budget,
@@ -428,7 +471,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         PendingSet pending_;
         std::vector<uint8_t> slot_state_;
         std::vector<int> slot_req_slot_;
-        std::vector<PID> ready_completed_;
+        std::vector<SlotID> ready_completed_;
         size_t inflight_count_ = 0;
     };
 
@@ -466,6 +509,12 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         std::vector<float> rotated_centroids_;
         MetricType metric_type_ = rabitqlib::METRIC_L2;
         float (*ip_func_)(const float *, const uint8_t *, size_t) = nullptr;
+
+        // What the SSD records hold (see SsdStore), and for the Raw store the
+        // element type of a record. Set by set_ssd_store at build time and
+        // restored from <base> by load_base / load_base_meta.
+        SsdStore ssd_store_ = SsdStore::ExBits;
+        VecElemType raw_elem_ = VecElemType::F32;
 
         bool empty_ssd_ = false;
 
@@ -515,6 +564,25 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         std::vector<size_t> cluster_page_presums_;
 
         void init_layout_metadata();
+        // One log line with the SSD store and the page layout it implies.
+        void log_ssd_layout() const;
+        // Write one Raw record: the dim_ input values in raw_elem_, followed by
+        // zeros up to padded_dim (dst points into a zeroed page buffer).
+        void write_raw_record(char *dst, const float *src) const;
+        // Validate the <base> version and, for version 2, read the SSD store
+        // fields that follow the metric. Version 1 means ExBits.
+        void read_base_store_fields(std::istream &input, uint32_t version,
+                                    const std::string &base_index_file);
+        // Gives <base>.ssd its full size before the build writes it, unless
+        // its file system lacks room for it plus reserve_bytes. Used by the
+        // 64-bit point-id build only.
+        void preallocate_ssd_file(uint64_t reserve_bytes);
+        // Exits when the clusters need more SSD pages than PageIdx can
+        // address (2^31 - 1 in the default build), naming the 64-bit build.
+        void check_ssd_pages(const std::vector<size_t> &cluster_sizes) const;
+        // Exits when the SSD records would hold only the 1-bit code beyond
+        // memdim, with no extra-precision code: a layout search cannot re-rank.
+        void check_ssd_layout_searchable() const;
         void init_clusters(const std::vector<size_t> &cluster_sizes);
         void quantize_and_write_clusterssd(ivf::Cluster &cp,
                                            const std::vector<PID> &ids,
@@ -575,10 +643,10 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         struct ClusterScanState
         {
             // Page-id tracking cursor (spans the whole cluster).
-            int last_page = -1;
-            PID cur_page_slot_id = kPidMax;
+            PageIdx last_page = -1;
+            SlotID cur_page_slot_id = kSlotMax;
             int cur_inner_pid = -1;
-            int cur_page = 0;
+            PageIdx cur_page = 0;
             int in_page_idx = 0;
             int remaining_in_page = 0;
             char *mem_data = nullptr;
@@ -590,7 +658,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         };
 
         // Initialise state at the start of a cluster scan.
-        void init_cluster_scan_state(const ivf::Cluster &cur_cluster, PID cid,
+        void init_cluster_scan_state(const ivf::Cluster &cur_cluster, CID cid,
                                      ClusterScanState &state);
 
         // Scan one 32-point batch (index `iter`) of the current cluster.
@@ -647,7 +715,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             bool use_hacc);
 
         void complete_distance_for_page_candidate(
-            PID slot_id, QueryBuffer *query_buf,
+            SlotID slot_id, QueryBuffer *query_buf,
             PageCandidate_IO_Queue<PendingSet> *io_queue,
             const SplitBatchQuery_nprobe<float> &q_obj,
             buffer::SearchBuffer<float> &knns,
@@ -656,7 +724,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         void push_pagecand_into_candidate_pool(
             QueryBuffer *query_buf,
             PageCandidate_IO_Queue<PendingSet> *io_queue,
-            PID slot_id,
+            SlotID slot_id,
             SearchStats *stats = nullptr);
 
     public:
@@ -686,6 +754,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
         [[nodiscard]] size_t num_clusters() const { return num_cluster_; }
         [[nodiscard]] size_t num_points() const { return num_; }
+        [[nodiscard]] size_t dim() const { return dim_; }
 
         // ---- Split-storage build / load API --------------------------------
         //
@@ -698,23 +767,26 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         // save_base(). Builds no coarse quantizer; the centroids are only
         // stored, not indexed.
         void construct_invlist(const float *data, const float *centroids,
-                               const PID *assignments, bool faster,
+                               const CID *assignments, bool faster,
                                ClusterOrderMode order_mode);
-        // Memory-budgeted streaming variant of construct_invlist. Produces a
-        // Same base index + SSD file as construct_invlist (byte-for-byte when
+        // Memory-budgeted streaming variant of construct_invlist. Produces the
+        // same base index + SSD file as construct_invlist (byte-for-byte when
         // RABITQ_ROTATOR_SEED pins the shared rotation), but never
-        // holds the whole fp32 dataset in DRAM: it streams the data from
-        // <data_file> (.fbin/.fvecs, float) through a cluster-partitioned
-        // reorder pass into a scratch subfolder next to <data_file>, then
+        // holds the whole dataset in DRAM: it streams the data from
+        // <data_file> (.fbin/.fvecs float32, .u8bin/.bvecs uint8) through a
+        // cluster-partitioned reorder pass into a scratch subfolder (next to
+        // <data_file> unless RABITQ_BUILD_SCRATCH_DIR says otherwise), then
         // quantizes group-by-group within mem_budget_bytes (total RSS ceiling).
         // centroids (C*dim) and assignments (N) are still passed in DRAM (small
         // relative to the dataset). See the .tpp definition for the P0-P3
-        // pipeline and the budget math.
+        // pipeline and the budget math. A nonzero prefix_rows indexes only the
+        // first prefix_rows rows of <data_file>.
         void construct_invlist_streaming(const std::string &data_file,
                                          const float *centroids,
-                                         const PID *assignments, bool faster,
+                                         const CID *assignments, bool faster,
                                          ClusterOrderMode order_mode,
-                                         size_t mem_budget_bytes);
+                                         size_t mem_budget_bytes,
+                                         size_t prefix_rows = 0);
         // Write the coarse-quantizer-independent base index to <base>.
         void save_base(const std::string &base_index_file);
 
@@ -755,6 +827,29 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             if (drain_alpha < 0.0F) drain_alpha = 0.0F;
             if (drain_alpha > 1.0F) drain_alpha = 1.0F;
             drain_alpha_ = drain_alpha;
+        }
+
+        // Select what the SSD records hold (see SsdStore). Call at build time,
+        // after construction and before construct_invlist*. For the Raw store
+        // raw_elem is the element type of the input vectors, which the records
+        // keep; Raw has no extra-precision code, so it also sets ex_bits to 0.
+        // Querying needs no call: load_base restores the store from <base>.
+        void set_ssd_store(SsdStore store, VecElemType raw_elem);
+        [[nodiscard]] SsdStore ssd_store() const { return ssd_store_; }
+        [[nodiscard]] VecElemType raw_elem() const { return raw_elem_; }
+        // "exbits" or "raw", the spelling build_invlist's store= option takes.
+        [[nodiscard]] const char *ssd_store_name() const
+        {
+            return ssd_store_ == SsdStore::Raw ? "raw" : "exbits";
+        }
+        // One line for logs, e.g. "exbits (B=9)" or "raw (uint8 records)".
+        [[nodiscard]] std::string ssd_store_description() const
+        {
+            if (ssd_store_ == SsdStore::Raw)
+            {
+                return std::string("raw (") + elem_type_name(raw_elem_) + " records)";
+            }
+            return "exbits (B=" + std::to_string(ex_bits_ + 1) + ")";
         }
 
         void batch_search(const float *queries, size_t nqueries, size_t topk,

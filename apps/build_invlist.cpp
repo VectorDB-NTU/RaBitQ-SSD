@@ -13,16 +13,20 @@
 #include <vector>
 
 #include "rabitqlib/defines.hpp"
+#include "rabitqlib/utils/id_files.hpp"
 #include "rabitqlib/utils/io.hpp"
 #include "rabitqlib/utils/io_auto.hpp"
 #include "rabitqlib/utils/stopw.hpp"
+#include "rabitqlib/utils/streaming_reader.hpp"
 #include "rabitqlib/utils/tools.hpp"
 #include "rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms.hpp"
 
 using PID = rabitqlib::PID;
+using CID = rabitqlib::CID;
 using index_type = rabitqlib::ivf_ssd_boundary_qd_ms::IVFSSD_Index;
+using SsdStore = rabitqlib::ivf_ssd_boundary_qd_ms::SsdStore;
 using data_type = rabitqlib::RowMajorArray<float>;
-using gt_type = rabitqlib::RowMajorArray<uint32_t>;
+using cid_type = rabitqlib::RowMajorArray<CID>;
 
 static std::string to_lower(std::string s)
 {
@@ -70,10 +74,13 @@ int main(int argc, char **argv)
         std::cerr << "Usage:\n"
                   << "  " << argv[0] << " <data> <centroids> <cluster_ids> <total_bits>"
                      " <base_index> <ssd_index> [options...]\n\n"
-                  << "data        : vectors to index, format .fvecs or .fbin (auto-detected)\n"
+                  << "data        : vectors to index: float32 .fbin/.fvecs or uint8 .u8bin/.bvecs\n"
+                  << "              (the extension decides)\n"
                   << "centroids   : centroids .fvecs from clustering/run_kmeans.sh\n"
-                  << "cluster_ids : per-point cluster assignment .ivecs from the same run\n"
-                  << "total_bits  : bits per dimension for the quantized code (the scripts use 9)\n"
+                  << "cluster_ids : per-point cluster assignment from the same run: .ivecs, or\n"
+                  << "              .cid64 (64-bit header) from the DINO GPU clustering\n"
+                  << "total_bits  : bits per dimension for the quantized code (the scripts use 9);\n"
+                  << "              ignored by store=raw\n"
                   << "base_index  : path for saving the in-RAM part of the index\n"
                   << "ssd_index   : path for saving the on-SSD part\n\n"
                   << "options, in any order:\n"
@@ -85,7 +92,14 @@ int main(int argc, char **argv)
                   << "  mem_budget_gb=<GiB>      build-time DRAM ceiling. When set, the dataset is\n"
                   << "                           streamed within this budget instead of loaded\n"
                   << "                           whole; the index is the same either way.\n"
-                  << "                           Keyed because the bare-integer slot is MEMDIM.\n\n"
+                  << "                           Keyed because the bare-integer slot is MEMDIM.\n"
+                  << "  store=exbits | raw       what the SSD records hold, exbits by default:\n"
+                  << "                           exbits = the rest of the 1-bit code plus\n"
+                  << "                           (total_bits-1)-bit extra-precision codes;\n"
+                  << "                           raw = the input vectors as given (float32 or\n"
+                  << "                           uint8), re-ranked with exact distances\n"
+                  << "  rows=<N>                 index only the first N rows of <data>; the\n"
+                  << "                           cluster ids must cover exactly those N\n\n"
                   << "This builds ONLY the inverted list. Build a coarse quantizer separately\n"
                   << "with build_coarse <base_index> <coarse_index> <kind>.\n"
                   << "Full reference: docs/cli_reference.md\n";
@@ -110,6 +124,11 @@ int main(int argc, char **argv)
     // (mem_budget_gb=N) rather than positional because the bare-integer
     // optional slot is already taken by MEMDIM.
     size_t mem_budget_bytes = 0;
+    // What the SSD records hold (store=exbits|raw). Saved in <base>, so the
+    // query side needs no matching flag.
+    SsdStore ssd_store = SsdStore::ExBits;
+    // rows=<N>: index only the first N rows of <data> (0 = all of them).
+    size_t prefix_rows = 0;
 
     for (int i = 7; i < argc; ++i)
     {
@@ -155,6 +174,55 @@ int main(int argc, char **argv)
             }
         }
 
+        // store=exbits|raw : what the SSD records hold.
+        {
+            const std::string key = "store=";
+            if (lower.rfind(key, 0) == 0)
+            {
+                const std::string v = lower.substr(key.size());
+                if (v == "exbits")
+                {
+                    ssd_store = SsdStore::ExBits;
+                }
+                else if (v == "raw")
+                {
+                    ssd_store = SsdStore::Raw;
+                }
+                else
+                {
+                    std::cerr << "Invalid store value: " << arg
+                              << " (expect store=exbits or store=raw)\n";
+                    return 1;
+                }
+                continue;
+            }
+        }
+
+        // rows=<N> : index a prefix of <data>.
+        {
+            const std::string key = "rows=";
+            if (lower.rfind(key, 0) == 0)
+            {
+                try
+                {
+                    size_t pos = 0;
+                    const std::string v = arg.substr(key.size());
+                    prefix_rows = static_cast<size_t>(std::stoull(v, &pos));
+                    if (pos != v.size() || prefix_rows == 0)
+                    {
+                        throw std::invalid_argument("bad rows");
+                    }
+                }
+                catch (const std::exception &)
+                {
+                    std::cerr << "Invalid rows value: " << arg
+                              << " (expect a positive integer)\n";
+                    return 1;
+                }
+                continue;
+            }
+        }
+
         bool bool_value = false;
         if (parse_bool(lower, bool_value))
         {
@@ -182,7 +250,7 @@ int main(int argc, char **argv)
         }
         catch (const std::exception &)
         {
-            std::cerr << "Invalid optional arg: " << arg << " (expect metric/ip|l2, faster true|false, order unordered|ordered, or MEMDIM)\n";
+            std::cerr << "Invalid optional arg: " << arg << " (expect metric/ip|l2, faster true|false, order unordered|ordered, store=exbits|raw, mem_budget_gb=<GiB>, rows=<N>, or MEMDIM)\n";
             return 1;
         }
     }
@@ -190,7 +258,22 @@ int main(int argc, char **argv)
     std::cout << "Metric Type: " << ((metric_type == rabitqlib::METRIC_IP) ? "IP" : "L2") << '\n';
     std::cout << "Faster quantization: " << (faster_quant ? "true" : "false") << '\n';
     std::cout << "Cluster order mode: " << ((order_mode == index_type::ClusterOrderMode::OrderedByCentroidDistance) ? "ordered" : "unordered") << '\n';
+    // The input's value width comes from its extension; a raw store keeps it.
+    const rabitqlib::VecElemType data_elem = rabitqlib::vector_elem_type(data_file);
+    std::cout << "Input values: " << rabitqlib::elem_type_name(data_elem) << '\n';
+    if (ssd_store == SsdStore::Raw)
+    {
+        std::cout << "SSD store: raw (" << rabitqlib::elem_type_name(data_elem)
+                  << " records; total_bits is ignored)\n";
+    }
+    else
+    {
+        std::cout << "SSD store: exbits (total_bits=" << total_bits << ")\n";
+    }
 
+#if defined(RABITQ_PID64)
+    std::cout << "Point ids: 64-bit\n";
+#endif
     const bool streaming = (mem_budget_bytes > 0);
     std::cout << "Build mode: "
               << (streaming ? "streaming (memory-budgeted)" : "full-DRAM")
@@ -203,23 +286,92 @@ int main(int argc, char **argv)
 
     data_type data;  // dataset is loaded only on the full-DRAM path
     data_type centroids;
-    gt_type cids;
+    cid_type cids;
 
     // Centroids (C*dim) and cluster ids (N) are always loaded -- small relative
     // to the dataset. The dataset itself is only loaded for the full path; the
     // streaming path reads it block-by-block from <data_file> instead.
     rabitqlib::load_matrix_auto<float, data_type>(centroids_file, centroids);
-    rabitqlib::load_matrix_auto<PID, gt_type>(cids_file, cids);
+    if (rabitqlib::has_u64_magic(cids_file, rabitqlib::kCid64Magic))
+    {
+        uint64_t cid64_clusters = 0;
+        rabitqlib::load_cid64(cids_file, cids, cid64_clusters);
+        if (cid64_clusters != static_cast<uint64_t>(centroids.rows()))
+        {
+            std::cerr << cids_file << " assigns to " << cid64_clusters
+                      << " clusters, but " << centroids_file << " holds "
+                      << centroids.rows() << " centroids\n";
+            return 1;
+        }
+    }
+    else
+    {
+        rabitqlib::load_matrix_auto<CID, cid_type>(cids_file, cids);
+    }
+    if (static_cast<size_t>(cids.rows()) > static_cast<size_t>(rabitqlib::kPidMax))
+    {
+        std::cerr << cids.rows() << " points do not fit in " << (8 * sizeof(PID))
+                  << "-bit point ids; build with -DRABITQ_PID64=ON (bin64/)\n";
+        return 1;
+    }
 
     size_t num_points;
     size_t dim;
     size_t k = centroids.rows();
 
+    if (prefix_rows != 0 && prefix_rows != static_cast<size_t>(cids.rows()))
+    {
+        std::cerr << "rows=" << prefix_rows << " but " << cids_file << " holds "
+                  << cids.rows() << " cluster ids\n";
+        return 1;
+    }
+
     if (!streaming)
     {
-        rabitqlib::load_matrix_auto<float, data_type>(data_file, data);
+        if (prefix_rows == 0)
+        {
+            rabitqlib::load_matrix_as_float<data_type>(data_file, data);
+        }
+        else
+        {
+            // Read just the prefix, a bounded block at a time.
+            rabitqlib::StreamingRowReader reader(data_file);
+            if (prefix_rows > reader.rows())
+            {
+                std::cerr << "rows=" << prefix_rows << " but " << data_file
+                          << " holds only " << reader.rows() << " rows\n";
+                return 1;
+            }
+            reader.limit_rows(prefix_rows);
+            data = data_type(static_cast<Eigen::Index>(prefix_rows),
+                             static_cast<Eigen::Index>(reader.cols()));
+            const size_t block = static_cast<size_t>(1) << 20;
+            for (size_t r = 0; r < prefix_rows; r += block)
+            {
+                const size_t n = std::min(block, prefix_rows - r);
+                reader.read_rows(r, n, data.data() + (r * reader.cols()));
+            }
+            std::cout << "Read the first " << prefix_rows << " of "
+                      << reader.file_rows() << " rows of " << data_file << '\n';
+        }
         num_points = data.rows();
         dim = data.cols();
+        if (static_cast<size_t>(cids.rows()) != num_points)
+        {
+            std::cerr << cids_file << " holds " << cids.rows()
+                      << " cluster ids but " << data_file << " has "
+                      << num_points << " rows\n";
+            return 1;
+        }
+        // The streaming build checks the data against the centroid width;
+        // this path takes its width from the data, so check the centroids.
+        if (static_cast<size_t>(centroids.cols()) != dim)
+        {
+            std::cerr << centroids_file << " holds " << centroids.cols()
+                      << "-dimensional centroids but " << data_file << " has "
+                      << dim << " dimensions\n";
+            return 1;
+        }
     }
     else
     {
@@ -237,9 +389,16 @@ int main(int argc, char **argv)
     rabitqlib::StopW stopw;
     // The coarse-quantizer ctor args are left at their defaults: build_invlist
     // builds no coarse quantizer, so coarse_kind / initializer_type are unused.
-    index_type ivf_ssd_index(num_points, dim, k, total_bits, ssd_index_file,
-                             metric_type, rabitqlib::RotatorType::FhtKacRotator,
-                             mem_dim);
+    // A raw store has no extra-precision code, so total_bits does not apply;
+    // 1 keeps the constructor's range check satisfied whatever was passed.
+    index_type ivf_ssd_index(num_points, dim, k,
+                             (ssd_store == SsdStore::Raw) ? 1 : total_bits,
+                             ssd_index_file, metric_type,
+                             rabitqlib::RotatorType::FhtKacRotator, mem_dim);
+    if (ssd_store == SsdStore::Raw)
+    {
+        ivf_ssd_index.set_ssd_store(SsdStore::Raw, data_elem);
+    }
     if (!streaming)
     {
         ivf_ssd_index.construct_invlist(data.data(), centroids.data(),
@@ -249,7 +408,7 @@ int main(int argc, char **argv)
     {
         ivf_ssd_index.construct_invlist_streaming(
             data_file, centroids.data(), cids.data(), faster_quant, order_mode,
-            mem_budget_bytes);
+            mem_budget_bytes, prefix_rows);
     }
 
     const float construct_min = stopw.get_elapsed_mili() / 1000 / 60;

@@ -5,9 +5,17 @@
 # Variable contract (set by the sourcing driver):
 #   DATASET  dataset label (log only)
 #   C B METRIC MEMDIM  index config (B = total bits, ex_bits = B-1)
+#   METRIC_TAG         _ip for METRIC=ip, else empty; ends the clustering and
+#                      inner k-means file names
+#   STORE              SSD records: exbits (codes, B bits) or raw (the vectors
+#                      as given, float32 or uint8; B does not apply)
 #   BUDGET_GB          streaming-build RSS budget (mem_budget_gb)
-#   DATA               train.fbin (the base vectors), read from fast storage;
-#                      the streaming reorder scratch is created NEXT TO it
+#   DATA               train.fbin, train.u8bin or train.bvecs (the base
+#                      vectors), read from fast storage; the streaming reorder
+#                      scratch is created NEXT TO it unless
+#                      RABITQ_BUILD_SCRATCH_DIR moves it
+#   ROWS_OPT           rows=<N> to index only the first N rows of DATA, or empty
+#   BIN_SUBDIR         bin, or bin64 for more than 2^32 - 1 points
 #   CEN CIDS           first-level k-means outputs (clustering/ tools)
 #   OUTDIR STEM        index output dir + file stem
 #
@@ -37,14 +45,19 @@
 # with clustering/run_kmeans.sh (see clustering/README.md).
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-INVLIST_BIN=${INVLIST_BIN_ENV:-${REPO}/bin/build_invlist}
-COARSE_BIN=${COARSE_BIN_ENV:-${REPO}/bin/build_coarse}
+INVLIST_BIN=${INVLIST_BIN_ENV:-${REPO}/${BIN_SUBDIR:-bin}/build_invlist}
+COARSE_BIN=${COARSE_BIN_ENV:-${REPO}/${BIN_SUBDIR:-bin}/build_coarse}
 IVF_CENTROIDS=${REPO}/clustering/ivf_centroids.py
 # Python with faiss + numpy (see clustering/README.md).
 PY=${PYTHON_ENV:-python3}
 
-# ORDER and B come from derive_params (they appear in the index name).
+# ORDER, B and STORE come from derive_params (they appear in the index name).
 FASTER=${FASTER_ENV:-false}
+STORE=${STORE:-exbits}
+# total_bits is build_invlist's 4th argument. The raw store has no
+# extra-precision code, so it gets 1 there and ignores it.
+TOTAL_BITS=${B}
+[[ ${STORE} == raw ]] && TOTAL_BITS=1
 # A size, not a count: ivf_centroids.py derives round(C / INNER) inner clusters.
 INNER=${INNER_SIZE_ENV:-1000}
 
@@ -76,15 +89,17 @@ build_index() {
         [[ -s "$f" ]] || { echo "[FATAL] missing prerequisite: $f"; exit 1; }
     done
 
-    echo "================ build ${DATASET} C=${C} B=${B} memdim=${MEMDIM} metric=${METRIC} coarse=${COARSE_KIND} ================"
+    local STORE_DESC="B=${B} (ex_bits=$((B-1)))"
+    [[ ${STORE} == raw ]] && STORE_DESC="store=raw"
+    echo "================ build ${DATASET} C=${C} ${STORE_DESC%% *} memdim=${MEMDIM} metric=${METRIC} coarse=${COARSE_KIND} ================"
     echo "  start  : $(date -Is)"
     echo "  outdir : ${OUTDIR}"
-    echo "  cfg    : B=${B} (ex_bits=$((B-1))) metric=${METRIC} order=${ORDER} faster=${FASTER} memdim=${MEMDIM} budget=${BUDGET_GB}GiB inner=${INNER}"
+    echo "  cfg    : ${STORE_DESC} metric=${METRIC} order=${ORDER} faster=${FASTER} memdim=${MEMDIM} budget=${BUDGET_GB}GiB inner=${INNER}"
     echo "==============================================================================="
 
     local LOG
-    INNER_CEN=$(dirname "${CEN}")/inner_centroids_C${C}_innersize${INNER}.fvecs
-    INNER_CIDS=$(dirname "${CEN}")/inner_clusterids_C${C}_innersize${INNER}.ivecs
+    INNER_CEN=$(dirname "${CEN}")/inner_centroids_C${C}_innersize${INNER}${METRIC_TAG}.fvecs
+    INNER_CIDS=$(dirname "${CEN}")/inner_clusterids_C${C}_innersize${INNER}${METRIC_TAG}.ivecs
 
     # ---- Phase B: inner (second-level) k-means for the IRQ coarse ----------
     if [[ ${COARSE_KIND} != irq ]]; then
@@ -106,10 +121,11 @@ build_index() {
     else
         echo "[invlist-C] start $(date -Is)"
         LOG=${OUTDIR}/build_invlist.log
-        echo "cmd: ${INVLIST_BIN} ${DATA} ${CEN} ${CIDS} ${B} ${BASE} ${SSD} ${METRIC} ${FASTER} ${ORDER} ${MEMDIM} mem_budget_gb=${BUDGET_GB}" | tee "${LOG}"
+        echo "cmd: ${INVLIST_BIN} ${DATA} ${CEN} ${CIDS} ${TOTAL_BITS} ${BASE} ${SSD} ${METRIC} ${FASTER} ${ORDER} ${MEMDIM} mem_budget_gb=${BUDGET_GB} store=${STORE}${ROWS_OPT:+ ${ROWS_OPT}}" | tee "${LOG}"
         /usr/bin/time -v "${INVLIST_BIN}" \
-            "${DATA}" "${CEN}" "${CIDS}" "${B}" "${BASE}" "${SSD}" \
+            "${DATA}" "${CEN}" "${CIDS}" "${TOTAL_BITS}" "${BASE}" "${SSD}" \
             "${METRIC}" "${FASTER}" "${ORDER}" "${MEMDIM}" "mem_budget_gb=${BUDGET_GB}" \
+            "store=${STORE}" ${ROWS_OPT:+"${ROWS_OPT}"} \
             >> "${LOG}" 2>&1 || { echo "[FATAL] build_invlist failed (see ${LOG})"; exit 1; }
         echo "[invlist-C] done $(date -Is)  base=$(stat -c %s "${BASE}") ssd=$(stat -c %s "${SSD}")"
     fi

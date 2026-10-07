@@ -11,9 +11,11 @@
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <vector>
 
 #include "rabitqlib/defines.hpp"
+#include "rabitqlib/utils/id_files.hpp"
 #include "rabitqlib/utils/io.hpp"
 #include "rabitqlib/utils/io_auto.hpp"
 #include "rabitqlib/utils/stopw.hpp"
@@ -25,18 +27,82 @@ using PID = rabitqlib::PID;
 using index_type = rabitqlib::ivf_ssd_boundary_qd_ms::IVFSSD_Index;
 using SearchStats = rabitqlib::ivf_ssd_boundary_qd_ms::SearchStats;
 using data_type = rabitqlib::RowMajorArray<float>;
-using gt_type = rabitqlib::RowMajorArray<uint32_t>;
+using gt_type = rabitqlib::RowMajorArray<PID>;
 using gt_dist_type = rabitqlib::RowMajorArray<float>;
+
+// Loads a file of 32-bit ids with load(matrix), widening them when point ids
+// are 64-bit.
+template <class Load>
+static void load_u32_ids(gt_type &ids, Load load)
+{
+    if constexpr (std::is_same_v<PID, uint32_t>)
+    {
+        load(ids);
+    }
+    else
+    {
+        rabitqlib::RowMajorArray<uint32_t> ids32;
+        load(ids32);
+        ids = ids32.cast<PID>();
+    }
+}
+
+// True when path is laid out as .ivecs: a whole number of [int32 k][k ids] rows,
+// every one starting with the same k.
+static bool is_consistent_ivecs(const char *path, size_t fsz)
+{
+    std::ifstream in(path, std::ios::binary);
+    int32_t k = 0;
+    in.read(reinterpret_cast<char *>(&k), sizeof(int32_t));
+    if (!in || k <= 0)
+    {
+        return false;
+    }
+    const size_t row_bytes = sizeof(int32_t) * (1 + static_cast<size_t>(k));
+    if (fsz % row_bytes != 0)
+    {
+        return false;
+    }
+    for (size_t r = 1; r < fsz / row_bytes; ++r)
+    {
+        int32_t head = 0;
+        in.seekg(static_cast<std::streamoff>(r * row_bytes), std::ios::beg);
+        in.read(reinterpret_cast<char *>(&head), sizeof(int32_t));
+        if (!in || head != k)
+        {
+            return false;
+        }
+    }
+    return true;
+}
 
 // ---- groundtruth loading with optional distances (DiskANN-style tie handling) ----
 // Supports DiskANN "type-1": [int32 nq][int32 k][nq*k uint32 ids][nq*k float32 dists]
-// (file size 8 + 2*nq*k*4), and falls back to ids-only (.bin / .ivecs). Distances let
-// recall extend the GT set through all neighbors tied with the k-th, which is required
-// for a meaningful recall on datasets containing duplicate base vectors.
+// (file size 8 + 2*nq*k*4), and falls back to ids-only (.bin / .ivecs, or .gt64
+// with 64-bit ids). A file named .ivecs that is laid out as one is read as
+// .ivecs before the type-1 size test, which a few .ivecs files would otherwise
+// pass by coincidence. Distances let recall extend the GT set through all
+// neighbors tied with the k-th, which is required for a meaningful recall on
+// datasets containing duplicate base vectors.
 // Returns true iff distances were loaded.
 static bool load_gt_maybe_type1(const char *path, gt_type &ids, gt_dist_type &dist)
 {
+    if (rabitqlib::has_u64_magic(path, rabitqlib::kGt64Magic))
+    {
+        rabitqlib::load_gt64(path, ids);
+        std::cout << "Groundtruth: ids-only (no distances) -> plain id-match recall\n";
+        return false;
+    }
     const size_t fsz = rabitqlib::get_filesize(path);
+    // An .ivecs name is taken at its word when the file really is laid out that
+    // way; otherwise the type-1 check below decides, as for any other name.
+    if (rabitqlib::detail::lowercase_ext(path) == "ivecs" && is_consistent_ivecs(path, fsz))
+    {
+        load_u32_ids(ids, [&](auto &m)
+                     { rabitqlib::load_matrix_auto<uint32_t>(path, m); });
+        std::cout << "Groundtruth: ids-only (no distances) -> plain id-match recall\n";
+        return false;
+    }
     int32_t nq = 0, k = 0;
     {
         std::ifstream in(path, std::ios::binary);
@@ -47,7 +113,8 @@ static bool load_gt_maybe_type1(const char *path, gt_type &ids, gt_dist_type &di
         8 + 2 * static_cast<size_t>(nq) * static_cast<size_t>(k) * sizeof(uint32_t);
     if (nq > 0 && k > 0 && fsz == sz_type1)
     {
-        rabitqlib::load_bin<uint32_t, gt_type>(path, ids); // [nq][k]+ids (ignores dist block)
+        load_u32_ids(ids, [&](auto &m)
+                     { rabitqlib::load_bin<uint32_t>(path, m); }); // [nq][k]+ids (ignores dist block)
         dist = gt_dist_type(nq, k);
         std::ifstream in(path, std::ios::binary);
         in.seekg(8 + static_cast<std::streamoff>(static_cast<size_t>(nq) * k * sizeof(uint32_t)),
@@ -57,7 +124,8 @@ static bool load_gt_maybe_type1(const char *path, gt_type &ids, gt_dist_type &di
         std::cout << "Groundtruth: type-1 (ids+distances) -> tie-aware recall enabled\n";
         return true;
     }
-    rabitqlib::load_matrix_auto<uint32_t, gt_type>(path, ids); // ids-only
+    load_u32_ids(ids, [&](auto &m)
+                 { rabitqlib::load_matrix_auto<uint32_t>(path, m); }); // ids-only
     std::cout << "Groundtruth: ids-only (no distances) -> plain id-match recall\n";
     return false;
 }
@@ -65,7 +133,7 @@ static bool load_gt_maybe_type1(const char *path, gt_type &ids, gt_dist_type &di
 // DiskANN-style recall count for one query: a result is correct if it matches any GT id
 // within top-`topk` EXTENDED through all neighbors tied (equal distance) with the topk-th.
 // Denominator stays `topk`. With gt_dist == nullptr this is plain id-intersection.
-static inline size_t count_correct_with_ties(const PID *res_ids, const uint32_t *gt_ids,
+static inline size_t count_correct_with_ties(const PID *res_ids, const PID *gt_ids,
                                              const float *gt_dist, size_t topk, size_t gt_stride)
 {
     size_t tie_breaker = topk;
@@ -317,7 +385,7 @@ int main(int argc, char **argv)
                   << "base_index  : path for the base index (inverted list) built by build_invlist\n"
                   << "ssd_index   : path for ssd index\n"
                   << "coarse_index: path for the coarse quantizer built by build_coarse\n"
-                  << "query       : path for query file, format .fvecs or .fbin (auto-detected)\n"
+                  << "query       : path for query file: float32 .fbin/.fvecs or uint8 .u8bin/.bvecs\n"
                   << "gt          : path for groundtruth file, format .ivecs or .bin (auto-detected; must contain >= topk neighbors per row)\n"
                   << "threads     : number of threads for querying\n"
                   << "key=value   : any order of:\n"
@@ -360,6 +428,12 @@ int main(int argc, char **argv)
     }
 
     int nthreads = std::atoi(argv[nthreads_arg_idx]);
+    if (nthreads < 1)
+    {
+        std::cerr << "threads must be a positive integer, got '"
+                  << argv[nthreads_arg_idx] << "'\n";
+        return 1;
+    }
     omp_set_num_threads(nthreads);
 
     size_t mem_dim = 0;
@@ -402,6 +476,11 @@ int main(int argc, char **argv)
             if (key == "topk")
             {
                 topk = static_cast<size_t>(std::stoull(value));
+                if (topk == 0)
+                {
+                    std::cerr << "topk must be at least 1\n";
+                    return 1;
+                }
                 continue;
             }
             if (key == "memdim")
@@ -467,7 +546,7 @@ int main(int argc, char **argv)
                               << " (expect a float in [0,1])\n";
                     return 1;
                 }
-                if (drain_alpha < 0.0F || drain_alpha > 1.0F)
+                if (!(drain_alpha >= 0.0F && drain_alpha <= 1.0F))  // also rejects NaN
                 {
                     std::cerr << "drain_alpha out of range: " << drain_alpha
                               << " (expect a float in [0,1])\n";
@@ -550,13 +629,22 @@ int main(int argc, char **argv)
     data_type query;
     gt_type gt;
     gt_dist_type gt_dist;
-    rabitqlib::load_matrix_auto<float, data_type>(query_file, query);
+    rabitqlib::load_matrix_as_float<data_type>(query_file, query);
     bool gt_has_dist = load_gt_maybe_type1(gt_file, gt, gt_dist);
     size_t nq = query.rows();
     if (static_cast<size_t>(gt.cols()) < topk)
     {
         std::cerr << "Groundtruth file has " << gt.cols()
                   << " neighbors per row, which is fewer than topk=" << topk << '\n';
+        return 1;
+    }
+    // Recall reads one ground-truth row per query. Extra rows are allowed, so a
+    // query file may be the first part of the set the ground truth covers.
+    if (static_cast<size_t>(gt.rows()) < nq)
+    {
+        std::cerr << "Groundtruth file " << gt_file << " has " << gt.rows()
+                  << " rows, fewer than the " << nq << " queries in " << query_file
+                  << '\n';
         return 1;
     }
     size_t total_count = nq * topk;
@@ -566,6 +654,18 @@ int main(int argc, char **argv)
     // Split storage: load the shared base (inverted list) first, then the
     // chosen coarse quantizer (load_coarse validates the pairing).
     ivf_ssd.load_base(base_index_file, ssd_index_file, mem_dim);
+    // The SSD store is a property of the index, read from <base>; the run
+    // scripts check this line against the store they meant to query.
+    std::cout << "SSD store: " << ivf_ssd.ssd_store_description() << '\n';
+#if defined(RABITQ_PID64)
+    std::cout << "Point ids: 64-bit\n";
+#endif
+    if (static_cast<size_t>(query.cols()) != ivf_ssd.dim())
+    {
+        std::cerr << "Query vectors have " << query.cols()
+                  << " dimensions but the index has " << ivf_ssd.dim() << ".\n";
+        return 1;
+    }
     ivf_ssd.load_coarse(coarse_index_file);
     ivf_ssd.init_buffers(nthreads, topk);
     // Apply the drain-phase alpha before any search runs, so the get_nprobes
@@ -580,10 +680,10 @@ int main(int argc, char **argv)
     // thorough check.)
     {
         const size_t n_points = ivf_ssd.num_points();
-        const uint32_t *gt_ids = gt.data();
+        const PID *gt_ids = gt.data();
         const size_t n_gt = static_cast<size_t>(gt.rows()) * gt_stride;
         size_t bad = 0;
-        uint32_t worst = 0;
+        PID worst = 0;
         for (size_t i = 0; i < n_gt; ++i)
         {
             if (static_cast<size_t>(gt_ids[i]) >= n_points)
@@ -744,7 +844,7 @@ int main(int argc, char **argv)
             std::vector<uint32_t> q_correct(nq);
             for (size_t i = 0; i < nq; ++i)
             {
-                const uint32_t *gt_ids = gt.data() + i * gt_stride;
+                const PID *gt_ids = gt.data() + i * gt_stride;
                 const float *gt_d = gt_has_dist ? (gt_dist.data() + i * gt_stride) : nullptr;
                 const PID *res_ids = results.data() + i * topk;
                 q_correct[i] = static_cast<uint32_t>(
@@ -1159,7 +1259,7 @@ static float probe_recall(index_type &ivf, size_t nprobe, data_type &query,
     size_t correct = 0;
     for (size_t i = 0; i < nq; ++i)
     {
-        const uint32_t *gt_ids = gt.data() + i * gt_stride;
+        const PID *gt_ids = gt.data() + i * gt_stride;
         const float *gt_d = gt_has_dist ? (gt_dist.data() + i * gt_stride) : nullptr;
         const PID *res_ids = results.data() + i * topk;
         correct += count_correct_with_ties(res_ids, gt_ids, gt_d, topk, gt_stride);

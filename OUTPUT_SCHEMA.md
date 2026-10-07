@@ -61,7 +61,7 @@ index_id,system,dataset,build_params,build_s,build_peak_rss_mb,index_mem_bytes,i
 |---|---|---|
 | index_id | str | unique index identifier (the index directory name) |
 | system, dataset | str | as above |
-| build_params | str | `;`-separated knobs, no commas (e.g. `C=...;B=9;memdim=...;metric=l2`) |
+| build_params | str | `;`-separated knobs, no commas (e.g. `C=...;B=9;memdim=...;metric=l2`, or `store=raw` in place of `B=` for a raw-store index) |
 | build_s | s | build wall time (note in build_params when clustering is shared across variants) |
 | build_peak_rss_mb | MiB | peak RSS during the build |
 | index_mem_bytes | bytes | in-RAM portion of the index |

@@ -10,12 +10,15 @@
 #   CFG_TAG   per-run directory / run_id prefix
 #   IDXDIR    directory holding <TAG>.base/.ssd/.coarse_<kind>[_inner<size>]
 #   TAG       index file stem
-#   DDIR      dataset dir holding test.fbin + gt<topk>
+#   DDIR      dataset dir holding gt<topk>
+#   QUERY_FILE  the queries: DDIR/test.fbin or DDIR/test.u8bin
+#   STORE     the SSD store the index was built with (exbits | raw)
 #   COARSE_KIND  irq (default) | flat | hnsw -- which coarse quantizer to load
 #   INNER_SUFFIX _inner<size> for a non-default IRQ inner size, else empty
 #
 # Env overrides accepted by every driver:
 #   MEMDIM_ENV IDX_DIR_ENV IDX_TAG_ENV OUT_TAG_SUFFIX  index/point selection
+#   STORE_ENV         exbits (default) | raw -- the SSD store the index holds
 #   COARSE_ENV        irq (default) | flat | hnsw -- the coarse-quantizer arm
 #   INNER_SIZE_ENV    the IRQ inner size the index was built with, if not 1000
 #   RECALL_HI_ENV RECALL_PLATEAU_ENV   cap the swept recall band. Needed when
@@ -26,7 +29,8 @@
 #   NPROBES_ENV       comma list: run these fixed operating points and SKIP the
 #                     adaptive recall map (e.g. rerun one thread count at the
 #                     operating points another run recorded in op_param)
-#   QUERY_BIN_ENV     override the querying binary (default bin/querying)
+#   QUERY_BIN_ENV     override the querying binary (default bin/querying, or
+#                     bin64/querying above 2^32 - 1 points)
 #   METHOD_EXT_ENV=1  also write this engine's internal scan-funnel counters
 #                     (method_ext CSV); off by default -- research instrument,
 #                     not part of the result schema
@@ -37,7 +41,7 @@
 # CSV is already filled, and header-once assembly of the merged CSVs.
 
 REPO=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd)
-QUERY_BIN=${QUERY_BIN_ENV:-${REPO}/bin/querying}
+QUERY_BIN=${QUERY_BIN_ENV:-${REPO}/${BIN_SUBDIR:-bin}/querying}
 
 COARSE_KIND=${COARSE_KIND:-irq}
 case ${COARSE_KIND} in
@@ -50,7 +54,8 @@ esac
 BASE=${IDXDIR}/${TAG}.base
 SSD=${IDXDIR}/${TAG}.ssd
 COARSE=${IDXDIR}/${TAG}.coarse_${COARSE_KIND}${INNER_SUFFIX:-}
-QUERY=${DDIR}/test.fbin
+QUERY=${QUERY_FILE:-${DDIR}/test.fbin}
+STORE=${STORE:-exbits}
 
 SYSTEM=RaBitQ-SSD
 USEHACC=true
@@ -154,7 +159,7 @@ run_grid() {
     # in its own log, so the banner does not guess.
     echo "================ ${CFG_TAG}${OUT_TAG_SUFFIX:-} ================"
     echo "  start  : $(date -Is)"
-    echo "  index  : ${IDXDIR}"
+    echo "  index  : ${IDXDIR}  (SSD store: ${STORE})"
     echo "  grid   : topk={${TOPKS[*]}} T={${TS[*]}}"
     if [[ ${COARSE_KIND} == irq ]]; then
         echo "  coarse : irq ${IRQ_MODE} mult=${OUTER_MULT} | drain_alpha=${DRAIN_ALPHA} | metric_space=${METRIC}"
@@ -214,6 +219,15 @@ run_grid() {
             if ! grep -qi "Coarse quantizer kind: ${COARSE_KIND}" "${LOG}"; then
                 echo "[FAIL] ${RUN}: expected coarse kind '${COARSE_KIND}', log says:" \
                      "$(grep -i -m1 'Coarse quantizer kind' "${LOG}" || echo '<no kind line>')"
+                rm -f "${CSV}.raw" "${MCSV}"; n_fail=$((n_fail+1)); continue
+            fi
+
+            # ---- guard: the index must hold the SSD store this run is about.
+            # The store is read from <base>, so a mistyped index path would
+            # otherwise silently benchmark the wrong kind of index. ----
+            if ! grep -q "SSD store: ${STORE}" "${LOG}"; then
+                echo "[FAIL] ${RUN}: expected SSD store '${STORE}', log says:" \
+                     "$(grep -m1 'SSD store:' "${LOG}" || echo '<no store line>')"
                 rm -f "${CSV}.raw" "${MCSV}"; n_fail=$((n_fail+1)); continue
             fi
 

@@ -17,14 +17,22 @@ bounds are looser.
 By default, an embedded IVF-RaBitQ index selects candidate clusters from the
 coarse centroids. Flat and HNSW coarse quantizers are also available.
 
-Supports L2 and inner-product metrics, and builds indexes larger than RAM by
-streaming the dataset within a memory budget you set.
+The SSD records can instead hold the vectors themselves, float32 or uint8, so
+that re-ranking is exact. The paper stores DINO-10B this way, and
+[docs/dino.md](docs/dino.md) reruns its scaling experiment on prefixes of the
+dataset, up to all ten billion vectors.
+
+Supports L2 and inner-product metrics, float32 and uint8 input, and builds
+indexes larger than RAM by streaming the dataset within a memory budget you
+set.
 
 ## Quick start
 
 **[docs/getting_started.md](docs/getting_started.md)** walks through a complete
 run — download, cluster, build, search — on a 1M-vector subset of YFCC-Images,
 then scales the same commands to the full 98.7M. Start there.
+**[docs/dino.md](docs/dino.md)** runs the DINO-10B prefixes of the paper's
+scaling experiment with one command per size.
 
 To build the command-line tools:
 
@@ -37,12 +45,19 @@ cmake --build build --parallel 8
 ```
 
 Subsequent workflow commands run from the repository root unless stated
-otherwise. The current kernels require Linux and an x86-64 CPU with AVX2 or
-AVX-512. The build uses `-march=native`, so compile on the machine where the
+otherwise. The current kernels require Linux and an x86-64 CPU with AVX-512.
+The build uses `-march=native`, so compile on the machine where the
 binaries will run.
 
 Binaries are stored in `bin/`: `build_invlist`, `build_coarse`, `querying`. Each
 prints its arguments when run with none.
+
+Point ids are 32-bit, and an SSD file can hold at most 8 TiB. For a dataset
+with more than 2^32 - 1 vectors, such as the full DINO-10B, or a larger SSD
+file, configure a second build with `-DRABITQ_PID64=ON` in its own build
+directory. Its binaries go to `bin64/`, the scripts switch to them above
+2^32 - 1 vectors, and each build reads only the indexes it wrote
+([docs/dino.md](docs/dino.md#5b-and-10b)).
 
 The clustering, ground-truth and index-build stages each run a Python script
 that imports `faiss` and `numpy`. If `python3` is not an interpreter that has
@@ -55,8 +70,9 @@ The search (`querying`) reads the SSD through Linux libaio.
 ## The pipeline
 
 Four stages. `<dataset>` is the directory holding `train.fbin` and `test.fbin`
-under `$DATA_ROOT`; the ground-truth stage is the one exception — it takes
-explicit paths, and you can skip it when your dataset ships its own.
+under `$DATA_ROOT`, or `train.u8bin` and `test.u8bin` for uint8 vectors; the
+ground-truth stage is the one exception — it takes explicit paths, and you can
+skip it when your dataset ships its own.
 
 | stage | command | produces |
 |---|---|---|
@@ -86,10 +102,10 @@ elsewhere.
 
 ## Parameters
 
-The configurations apply to all datasets. A `.fbin` begins with `[int32 n][int32 d]`,
-so every stage reads those two numbers off the data and derives the rest the
-same way — which is why the clustering, the index and the search agree without
-a config file:
+The configurations apply to all datasets. A `.fbin` (float32) and a `.u8bin`
+(uint8) both begin with `[int32 n][int32 d]`, so every stage reads those two
+numbers off the data and derives the rest the same way — which is why the
+clustering, the index and the search agree without a config file:
 
 | parameter | default | override |
 |---|---|---|
@@ -98,14 +114,18 @@ a config file:
 | metric | `l2` | `METRIC_ENV=ip` |
 | bits per dimension `B` | 9 — one sign bit plus 8 of extra precision | `B_ENV` (2–9) |
 | cluster layout | `ordered` — points sorted by distance to their centroid | `ORDER_ENV=unordered` |
+| SSD records | `exbits` — the rest of the 1-bit code plus `B-1`-bit extra-precision codes | `STORE_ENV=raw` |
 
-All five appear in the index directory and file names, so **an override must be
+All of them appear in the index directory and file names, so **an override must be
 repeated across stages**. Omitting one can either produce a missing-file error
 or select an existing index built with the defaults. They are derived in one place
 ([`scripts/_params.sh`](scripts/_params.sh)) precisely so the build and the
 search cannot compose different names.
 
-Lower `B` reduces the SSD footprint and re-ranking precision.
+Lower `B` reduces the SSD footprint and re-ranking precision. `STORE_ENV=raw`
+stores each vector as given instead, float32 or uint8, and re-ranks with exact
+distances; `B` then does not apply. A raw float32 record is four times the
+size of the default one at `B = 9`, while a uint8 one is the same size.
 
 Other knobs, all optional:
 
@@ -150,9 +170,9 @@ apps/                     build_invlist, build_coarse, querying
 rabitqlib/, src/          the implementation (header-only) + vendored Eigen, hnswlib
 clustering/               k-means over the vectors, and over the centroids
 groundtruth/              exact-KNN ground truth: generation and validation
-scripts/                  the build and search stages
-tools/                    format conversion
-docs/                     getting_started.md, cli_reference.md
+scripts/                  the build and search stages; the DINO-10B driver and its GPU clustering
+tools/                    format conversion, DINO-10B download and preparation
+docs/                     getting_started.md, dino.md, cli_reference.md
 ```
 
 `rabitqlib/` is a vendored copy of the RaBitQ-Library headers extended

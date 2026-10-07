@@ -42,6 +42,15 @@ def read_fbin_meta(p):
     return int(n), int(d)
 
 
+def vec_dtype(p):
+    """Value type of a .fbin-layout file, from its extension: .u8bin is uint8 (e.g.
+    DINO-10B), anything else float32. Both share the [int32 n][int32 d] header."""
+    ext = os.path.splitext(p)[1].lower()
+    if ext == ".i8bin":
+        raise SystemExit(f"{p}: int8 vectors (.i8bin) are not supported")
+    return np.uint8 if ext == ".u8bin" else np.float32
+
+
 def write_type1(path, ids, dists):
     nq, k = ids.shape
     tmp = path + ".part"
@@ -73,9 +82,11 @@ def main():
     nb, d = read_fbin_meta(args.base)
     nq, dq = read_fbin_meta(args.queries)
     assert dq == d, (dq, d)
-    base = np.memmap(args.base, dtype=np.float32, mode="r", offset=8, shape=(nb, d))
+    # A uint8 base stays uint8 on disk; every use below widens what it reads.
+    base = np.memmap(args.base, dtype=vec_dtype(args.base), mode="r", offset=8, shape=(nb, d))
     q = np.ascontiguousarray(
-        np.memmap(args.queries, dtype=np.float32, mode="r", offset=8, shape=(nq, d)))
+        np.memmap(args.queries, dtype=vec_dtype(args.queries), mode="r", offset=8,
+                  shape=(nq, d)), dtype=np.float32)
     K = args.maxk
     M = min(max(args.rerank_m, K), 2048)
     # Retrieval keeps M candidates and the re-rank picks the best K of them, so

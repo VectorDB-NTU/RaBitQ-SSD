@@ -154,6 +154,109 @@ inline T dot_product(const T* __restrict__ vec0, const T* __restrict__ vec1, siz
     return v0.dot(v1);
 }
 
+// Distances between a float32 vector x and a uint8 vector y, used to re-rank
+// raw uint8 SSD records. Each uint8 value is widened exactly to float32.
+// Any dim is accepted: the SIMD loops leave a scalar tail.
+namespace u8_impl {
+#if defined(__AVX2__) && !defined(__AVX512F__)
+inline float hsum256(__m256 v) {
+    __m128 lo = _mm_add_ps(_mm256_castps256_ps128(v), _mm256_extractf128_ps(v, 1));
+    __m128 shuf = _mm_movehdup_ps(lo);
+    __m128 sums = _mm_add_ps(lo, shuf);
+    shuf = _mm_movehl_ps(shuf, sums);
+    sums = _mm_add_ss(sums, shuf);
+    return _mm_cvtss_f32(sums);
+}
+
+inline __m256 fmadd256(__m256 a, __m256 b, __m256 c) {
+#if defined(__FMA__)
+    return _mm256_fmadd_ps(a, b, c);
+#else
+    return _mm256_add_ps(_mm256_mul_ps(a, b), c);
+#endif
+}
+#endif
+}  // namespace u8_impl
+
+// Squared L2 distance between x (float32) and y (uint8).
+inline float l2sqr_f32_u8(
+    const float* __restrict__ x, const uint8_t* __restrict__ y, size_t dim
+) {
+    size_t i = 0;
+    float result = 0.0F;
+#if defined(__AVX512F__)
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    for (; i + 32 <= dim; i += 32) {
+        const __m512 y0 = _mm512_cvtepi32_ps(
+            _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(y + i)))
+        );
+        const __m512 y1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(y + i + 16))
+        ));
+        const __m512 d0 = _mm512_sub_ps(_mm512_loadu_ps(x + i), y0);
+        const __m512 d1 = _mm512_sub_ps(_mm512_loadu_ps(x + i + 16), y1);
+        acc0 = _mm512_fmadd_ps(d0, d0, acc0);
+        acc1 = _mm512_fmadd_ps(d1, d1, acc1);
+    }
+    result = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#elif defined(__AVX2__)
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    for (; i + 16 <= dim; i += 16) {
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(y + i));
+        const __m256 y0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(b));
+        const __m256 y1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(b, 8)));
+        const __m256 d0 = _mm256_sub_ps(_mm256_loadu_ps(x + i), y0);
+        const __m256 d1 = _mm256_sub_ps(_mm256_loadu_ps(x + i + 8), y1);
+        acc0 = u8_impl::fmadd256(d0, d0, acc0);
+        acc1 = u8_impl::fmadd256(d1, d1, acc1);
+    }
+    result = u8_impl::hsum256(_mm256_add_ps(acc0, acc1));
+#endif
+    for (; i < dim; ++i) {
+        const float d = x[i] - static_cast<float>(y[i]);
+        result += d * d;
+    }
+    return result;
+}
+
+// Inner product of x (float32) and y (uint8).
+inline float ip_f32_u8(const float* __restrict__ x, const uint8_t* __restrict__ y, size_t dim) {
+    size_t i = 0;
+    float result = 0.0F;
+#if defined(__AVX512F__)
+    __m512 acc0 = _mm512_setzero_ps();
+    __m512 acc1 = _mm512_setzero_ps();
+    for (; i + 32 <= dim; i += 32) {
+        const __m512 y0 = _mm512_cvtepi32_ps(
+            _mm512_cvtepu8_epi32(_mm_loadu_si128(reinterpret_cast<const __m128i*>(y + i)))
+        );
+        const __m512 y1 = _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(y + i + 16))
+        ));
+        acc0 = _mm512_fmadd_ps(_mm512_loadu_ps(x + i), y0, acc0);
+        acc1 = _mm512_fmadd_ps(_mm512_loadu_ps(x + i + 16), y1, acc1);
+    }
+    result = _mm512_reduce_add_ps(_mm512_add_ps(acc0, acc1));
+#elif defined(__AVX2__)
+    __m256 acc0 = _mm256_setzero_ps();
+    __m256 acc1 = _mm256_setzero_ps();
+    for (; i + 16 <= dim; i += 16) {
+        const __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(y + i));
+        const __m256 y0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(b));
+        const __m256 y1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(b, 8)));
+        acc0 = u8_impl::fmadd256(_mm256_loadu_ps(x + i), y0, acc0);
+        acc1 = u8_impl::fmadd256(_mm256_loadu_ps(x + i + 8), y1, acc1);
+    }
+    result = u8_impl::hsum256(_mm256_add_ps(acc0, acc1));
+#endif
+    for (; i < dim; ++i) {
+        result += x[i] * static_cast<float>(y[i]);
+    }
+    return result;
+}
+
 template <typename T>
 inline T normalize_vec(
     const T* __restrict__ vec, const T* __restrict__ centroid, T* res, T dist2c, size_t dim

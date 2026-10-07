@@ -4,15 +4,21 @@
 #   DATA_ENV=/path/to/datasets/<dataset>/train.fbin \
 #   OUTDIR_ENV=/path/to/indexes/<dataset>/clustering ./run_kmeans.sh <dataset>
 #
+# DATA_ENV is the base: train.fbin (float32) or train.u8bin (uint8). Every row
+# of it is clustered, so N_ENV, which indexes only a prefix of a longer file,
+# is refused here.
+#
 #   reservoir subsample -> two-level cluster -> HNSW approx assign (efS=64)
 #   -> per-cluster-mean centroids + clusterids, i.e.
-#   centroids_<C>.fvecs + clusterids_<C>.ivecs in OUTDIR_ENV.
+#   centroids_<C>.fvecs + clusterids_<C>.ivecs in OUTDIR_ENV; with
+#   METRIC_ENV=ip every output name ends in _ip instead, so an l2 and an ip
+#   clustering of one dataset can share OUTDIR_ENV.
 #
 # CPU only: CUDA_VISIBLE_DEVICES="" hides any GPU, so no GPU kernel runs even on
 # a CUDA build of faiss.
 #
 # Every dataset uses the same knobs (240 pts/centroid, HNSW efS=64,
-# 25 coarse iterations, seed 1234). C is derived from the base vectors and the
+# 25 coarse iterations). C is derived from the base vectors and the
 # fan-out follows as round(sqrt(C)); see scripts/_params.sh for the defaults
 # and their overrides.
 #
@@ -40,29 +46,38 @@ PY=${PYTHON_ENV:-python3}   # any python with faiss + numpy
 
 # Locked knobs shared by every dataset: pts_per_centroid 240 sets n_train
 # (240*C sampled rows), HNSW efS=64 is the approx-assign search width, and the
-# coarse k-means runs 25 iterations from seed 1234.
-PPC=240; EFS=64; NITER=25; SEED=1234
+# coarse k-means runs 25 iterations.
+PPC=240; EFS=64; NITER=25
 
-: "${DATA_ENV:?set DATA_ENV to the ${DATASET} train.fbin, e.g. export DATA_ENV=/path/to/datasets/${DATASET}/train.fbin}"
+: "${DATA_ENV:?set DATA_ENV to the ${DATASET} train.fbin or train.u8bin, e.g. export DATA_ENV=/path/to/datasets/${DATASET}/train.fbin}"
 : "${OUTDIR_ENV:?set OUTDIR_ENV to the directory that receives the coarse-quantizer outputs, e.g. export OUTDIR_ENV=/path/to/indexes/${DATASET}/clustering}"
 DATA=${DATA_ENV}
 OUTDIR=${OUTDIR_ENV}
 mkdir -p "$OUTDIR"
 
 derive_params "${DATA}" || exit 1
+case ${DATA} in
+    *.bvecs|*.fvecs)
+        echo "[FATAL] ${DATA}: this clustering reads .fbin or .u8bin files" \
+             "(convert .fvecs with tools/fvecs_to_fbin.py)"
+        exit 1 ;;
+esac
+if [[ -n ${ROWS_OPT} ]]; then
+    echo "[FATAL] N_ENV=${N_ENV} indexes the first ${N} rows of ${DATA}, but this" \
+         "clustering reads the whole file; give it a file holding exactly those rows"
+    exit 1
+fi
 NC1=$(awk -v c="$C" 'BEGIN{printf "%d", int(sqrt(c)+0.5)}')
 
-# The log names the metric only when it is not the default L2, so an ip run
-# never overwrites an l2 log in the same clustering dir.
-MSUF=""
-[[ ${METRIC} != l2 ]] && MSUF=_${METRIC}
-LOG=$OUTDIR/kmeans_C${C}${MSUF}.log
-TIMEV=$OUTDIR/time_v_kmeans${MSUF}.txt
+# Every output names the metric when it is not the default L2 (METRIC_TAG), so
+# an ip run never reuses or overwrites an l2 clustering in the same directory.
+LOG=$OUTDIR/kmeans_C${C}${METRIC_TAG}.log
+TIMEV=$OUTDIR/time_v_kmeans${METRIC_TAG}.txt
 
 [[ -s "$DATA" ]]   || { echo "[FATAL] missing train: $DATA"; exit 1; }
 [[ -s "$DRIVER" ]] || { echo "[FATAL] missing driver: $DRIVER"; exit 1; }
 
-if [[ -s "$OUTDIR/centroids_${C}.fvecs" && -s "$OUTDIR/clusterids_${C}.ivecs" ]]; then
+if [[ -s "$OUTDIR/centroids_${C}${METRIC_TAG}.fvecs" && -s "$OUTDIR/clusterids_${C}${METRIC_TAG}.ivecs" ]]; then
     echo "[kmeans] reuse existing C=${C} (centroids+clusterids exist) -> skip"; exit 0
 fi
 
@@ -75,7 +90,7 @@ CUDA_VISIBLE_DEVICES="" OMP_PROC_BIND=close OMP_PLACES=cores \
   "$PY" "$DRIVER" --line cpu \
     --base "$DATA" --out-dir "$OUTDIR" --dataset "$DATASET" \
     --C "$C" --nc1 "$NC1" --pts-per-centroid "$PPC" \
-    --metric "$METRIC" --hnsw-efs "$EFS" --niter "$NITER" --seed "$SEED" \
+    --metric "$METRIC" --hnsw-efs "$EFS" --niter "$NITER" --name-suffix "$METRIC_TAG" \
   2>&1 | tee -a "$LOG"
 RC=${PIPESTATUS[0]}
 
