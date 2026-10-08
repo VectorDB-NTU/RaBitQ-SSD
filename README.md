@@ -45,8 +45,8 @@ cmake --build build --parallel 8
 ```
 
 Subsequent workflow commands run from the repository root unless stated
-otherwise. The current kernels require Linux and an x86-64 CPU with AVX-512.
-The build uses `-march=native`, so compile on the machine where the
+otherwise. The current kernels require Linux and an x86-64 CPU with AVX2 or
+AVX-512. The build uses `-march=native`, so compile on the machine where the
 binaries will run.
 
 Binaries are stored in `bin/`: `build_invlist`, `build_coarse`, `querying`. Each
