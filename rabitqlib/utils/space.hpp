@@ -873,6 +873,58 @@ inline TF ip_fxi(const TF* __restrict__ vec0, const TI* __restrict__ vec1, size_
     ConstVectorMap<TI> v1(vec1, dim);
     return v0.dot(v1.template cast<TF>());
 }
+
+// Adapted from RaBitQ-Library 8b370a1 space_excode_avx{2,512}.cpp.
+// Keep unsigned bytes and the existing on-disk layout; allow unaligned inputs.
+inline float ip16_fxu8_avx(
+    const float* __restrict__ query, const uint8_t* __restrict__ code, size_t dim
+) {
+#if defined(__AVX512F__)
+    __m512 sum0 = _mm512_setzero_ps(), sum1 = sum0, sum2 = sum0, sum3 = sum0;
+    const auto unpack_code = [&](size_t k) {
+        return _mm512_cvtepi32_ps(_mm512_cvtepu8_epi32(
+            _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + k))
+        ));
+    };
+    size_t i = 0;
+    for (; dim - i >= 64; i += 64) {
+        sum0 = _mm512_fmadd_ps(unpack_code(i), _mm512_loadu_ps(query + i), sum0);
+        sum1 = _mm512_fmadd_ps(unpack_code(i + 16), _mm512_loadu_ps(query + i + 16), sum1);
+        sum2 = _mm512_fmadd_ps(unpack_code(i + 32), _mm512_loadu_ps(query + i + 32), sum2);
+        sum3 = _mm512_fmadd_ps(unpack_code(i + 48), _mm512_loadu_ps(query + i + 48), sum3);
+    }
+    for (; dim - i >= 16; i += 16) {
+        sum0 = _mm512_fmadd_ps(unpack_code(i), _mm512_loadu_ps(query + i), sum0);
+    }
+    float result = _mm512_reduce_add_ps(
+        _mm512_add_ps(_mm512_add_ps(sum0, sum1), _mm512_add_ps(sum2, sum3))
+    );
+#elif defined(__AVX2__) && defined(__FMA__)
+    __m256 sum0 = _mm256_setzero_ps(), sum1 = sum0;
+    size_t i = 0;
+    for (; dim - i >= 16; i += 16) {
+        const __m128i bytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(code + i));
+        const __m256 lo = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(bytes));
+        const __m256 hi = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(bytes, 8)));
+        sum0 = _mm256_fmadd_ps(_mm256_loadu_ps(query + i), lo, sum0);
+        sum1 = _mm256_fmadd_ps(_mm256_loadu_ps(query + i + 8), hi, sum1);
+    }
+    const __m256 sum = _mm256_add_ps(sum0, sum1);
+    __m128 h = _mm_add_ps(_mm256_castps256_ps128(sum), _mm256_extractf128_ps(sum, 1));
+    h = _mm_add_ps(h, _mm_movehl_ps(h, h));
+    float result = _mm_cvtss_f32(_mm_add_ss(h, _mm_movehdup_ps(h)));
+#else
+    return ip_fxi(query, code, dim);
+#endif
+#if defined(__AVX512F__) || (defined(__AVX2__) && defined(__FMA__))
+    // Production codes are padded; this tail also preserves the old generic contract.
+    for (; i < dim; ++i) {
+        result += query[i] * static_cast<float>(code[i]);
+    }
+    return result;
+#endif
+}
+
 }  // namespace excode_ipimpl
 
 using ex_ipfunc = float (*)(const float*, const uint8_t*, size_t);
@@ -901,7 +953,7 @@ inline ex_ipfunc select_excode_ipfunc(size_t ex_bits) {
         return excode_ipimpl::ip64_fxu7_avx;
     }
     if (ex_bits == 8) {
-        return excode_ipimpl::ip_fxi;
+        return excode_ipimpl::ip16_fxu8_avx;
     }
 
     std::cerr << "Bad IP function for IVF\n";
