@@ -393,7 +393,11 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
         ids_.assign(num_rabitq_coded, 0);
 
         // ----- Quantize each inner cluster -----
+        // Clusters are independent and write disjoint ranges at precomputed
+        // offsets, so they run in parallel and the output does not depend on
+        // the thread count.
         quant::RabitqConfig config;  // default quantization configuration
+#pragma omp parallel for schedule(dynamic)
         for (size_t c = 0; c < num_inner_cluster_; ++c) {
             const auto& ids = id_lists[c];
             const size_t n = ids.size();

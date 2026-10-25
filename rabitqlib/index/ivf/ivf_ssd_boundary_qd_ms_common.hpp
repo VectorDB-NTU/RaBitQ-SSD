@@ -574,8 +574,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         void read_base_store_fields(std::istream &input, uint32_t version,
                                     const std::string &base_index_file);
         // Gives <base>.ssd its full size before the build writes it, unless
-        // its file system lacks room for it plus reserve_bytes. Used by the
-        // 64-bit point-id build only.
+        // its file system lacks room for it plus reserve_bytes.
         void preallocate_ssd_file(uint64_t reserve_bytes);
         // Exits when the clusters need more SSD pages than PageIdx can
         // address (2^31 - 1 in the default build), naming the 64-bit build.

@@ -1237,9 +1237,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
         file_reader_ = std::make_shared<LinuxAlignedFileReader>();
         file_reader_->open(ssd_index_file_, true, true);
-#if defined(RABITQ_PID64)
         preallocate_ssd_file(0);
-#endif
 
         // Held as a member rather than a local so save_base can persist it;
         // the coarse quantizer is built from this block later.
@@ -1417,17 +1415,28 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             (num_cluster_ * padded_dim_ * sizeof(float)) +  // rotated centroids
             (num_cluster_ * dim_ * sizeof(float)) +         // raw centroids
             (num_ * sizeof(CID));                           // assignments
-        const double b_total = 0.85 * static_cast<double>(mem_budget_bytes);
-        if (b_total <= static_cast<double>(r_res))
+        // Small clusters write in parallel across clusters; a big cluster
+        // writes in parallel across chunks. Both need at most T buffers,
+        // with the same chunk sizing as quantize_and_write_cluster_core.
+        const size_t writer_buffer_bytes =
+            (one_data_ssd_bytes_ == 0)
+                ? 0
+                : std::max<size_t>(1, kSsdWriteChunkPages / page_num_per_io_) *
+                      (SECTOR_LEN * page_num_per_io_);
+        const size_t writer_reserve = T * writer_buffer_bytes;
+        const size_t b_total = static_cast<size_t>(
+            0.85 * static_cast<double>(mem_budget_bytes));
+        if (b_total <= r_res || b_total - r_res <= writer_reserve)
         {
             LOG(ERROR) << "streaming build: mem_budget too small. Resident "
                           "structures need ~"
-                       << (r_res >> 30) << " GiB but 0.85*budget = "
-                       << (static_cast<size_t>(b_total) >> 30)
-                       << " GiB. Lower MEMDIM or raise mem_budget_gb.";
+                       << (r_res >> 20) << " MiB and SSD writer buffers reserve ~"
+                       << (writer_reserve >> 20) << " MiB for " << T
+                       << " threads, but 0.85*budget = " << (b_total >> 20)
+                       << " MiB. Lower MEMDIM or build threads, or raise mem_budget_gb.";
             std::exit(1);
         }
-        const size_t b_trans = static_cast<size_t>(b_total) - r_res;
+        const size_t b_trans = b_total - r_res - writer_reserve;
 
         // theta: small-cluster threshold. Up to T small clusters rotate
         // concurrently; cap their rotation temps at 25% of the transient.
@@ -1609,7 +1618,6 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                        << scratch_dir << ": " << ec.message();
             std::exit(1);
         }
-#if defined(RABITQ_PID64)
         {
             // The scratch fills before the SSD file does, so preallocation
             // must leave room for it when both share a file system.
@@ -1622,7 +1630,6 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             preallocate_ssd_file(
                 same_fs ? num_ * (scratch_row_bytes + sizeof(ReorderMeta)) : 0);
         }
-#endif
         auto vec_path = [&](size_t f) {
             return (scratch_dir / ("g" + std::to_string(f) + ".vec")).string();
         };

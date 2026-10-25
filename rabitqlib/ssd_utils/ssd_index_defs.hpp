@@ -10,14 +10,10 @@
 constexpr size_t SECTOR_LEN = 4096;
 
 // Pages the index build fills into one buffer before issuing a single pwrite.
-// The 64-bit point-id build writes multi-terabyte SSD files, so it batches
-// 1024 pages (4 MiB) per write and preallocates the file; the default build
-// writes one page at a time.
-#if defined(RABITQ_PID64)
+// Writing 1024 pages (4 MiB) at a time into a preallocated file keeps the
+// parallel writers from serializing on the file system; the bytes written do
+// not depend on this value.
 constexpr size_t kSsdWriteChunkPages = 1024;
-#else
-constexpr size_t kSsdWriteChunkPages = 1;
-#endif
 
 // Maximum number of reads a single thread may keep in flight. It sizes the
 // reader's event limit (MAX_EVENTS), the libaio queue (io_setup nr_events) and

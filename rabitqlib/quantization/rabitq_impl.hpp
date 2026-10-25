@@ -11,6 +11,7 @@
 #include "rabitqlib/defines.hpp"
 #include "rabitqlib/fastscan/fastscan.hpp"
 #include "rabitqlib/quantization/pack_excode.hpp"
+#include "rabitqlib/quantization/rescale_search.hpp"
 #include "rabitqlib/utils/space.hpp"
 
 namespace rabitqlib::quant::rabitq_impl
@@ -435,106 +436,22 @@ namespace rabitqlib::quant::rabitq_impl
          * @param ex_bits   Number of bits used for code
          * @return ipnorm_inv  Returned factor
          */
-
-        constexpr std::array<float, 9> kTightStart = {
-            0,
-            0.15,
-            0.20,
-            0.52,
-            0.59,
-            0.71,
-            0.75,
-            0.77,
-            0.81,
-        };
-
-        template <typename T>
-        inline double best_rescale_factor(const T *o_abs, size_t dim, size_t ex_bits)
-        {
-            constexpr double kEps = 1e-5;
-            constexpr int kNEnum = 10;
-            double max_o = *std::max_element(o_abs, o_abs + dim);
-
-            double t_end = static_cast<double>(((1 << ex_bits) - 1) + kNEnum) / max_o;
-            double t_start = t_end * kTightStart[ex_bits];
-
-            std::vector<int> cur_o_bar(dim);
-            double sqr_denominator = static_cast<double>(dim) * 0.25;
-            double numerator = 0;
-
-            for (size_t i = 0; i < dim; ++i)
-            {
-                int cur = static_cast<int>((t_start * o_abs[i]) + kEps);
-                cur_o_bar[i] = cur;
-                sqr_denominator += (cur * cur) + cur;
-                numerator += (cur + 0.5) * o_abs[i];
-            }
-
-            std::priority_queue<
-                std::pair<double, size_t>,
-                std::vector<std::pair<double, size_t>>,
-                std::greater<>>
-                next_t;
-
-            for (size_t i = 0; i < dim; ++i)
-            {
-                next_t.emplace(static_cast<double>(cur_o_bar[i] + 1) / o_abs[i], i);
-            }
-
-            double max_ip = 0;
-            double t = 0;
-
-            while (!next_t.empty())
-            {
-                double cur_t = next_t.top().first;
-                size_t update_id = next_t.top().second;
-                next_t.pop();
-
-                cur_o_bar[update_id]++;
-                int update_o_bar = cur_o_bar[update_id];
-                sqr_denominator += 2 * update_o_bar;
-                numerator += o_abs[update_id];
-
-                double cur_ip = numerator / std::sqrt(sqr_denominator);
-                if (cur_ip > max_ip)
-                {
-                    max_ip = cur_ip;
-                    t = cur_t;
-                }
-
-                if (update_o_bar < (1 << ex_bits) - 1)
-                {
-                    double t_next = static_cast<double>(update_o_bar + 1) / o_abs[update_id];
-                    if (t_next < t_end)
-                    {
-                        next_t.emplace(t_next, update_id);
-                    }
-                }
-            }
-
-            return t;
-        }
-
         template <typename T, typename TP>
         inline T quantize_ex(const T *o_abs, TP *code, size_t dim, size_t ex_bits)
         {
-            constexpr double kEps = 1e-5;
-            double t = best_rescale_factor<T>(o_abs, dim, ex_bits);
+            const double t = best_rescale_factor<T>(o_abs, dim, ex_bits);
+            const int max_code = (1 << ex_bits) - 1;
             double ipnorm = 0;
 
-            std::vector<int> tmp_code(dim);
             for (size_t i = 0; i < dim; i++)
             {
-                // compute and store code
-                tmp_code[i] = static_cast<int>((t * o_abs[i]) + kEps);
-                if (tmp_code[i] >= (1 << ex_bits))
-                {
-                    tmp_code[i] = (1 << ex_bits) - 1;
-                }
-                code[i] = static_cast<TP>(tmp_code[i]);
+                // the code state the search evaluated at t
+                const int value =
+                    quantized_level_at_scale(static_cast<double>(o_abs[i]), t, max_code);
+                code[i] = static_cast<TP>(value);
 
                 // ip * norm = unnormalized ip
-                ipnorm += (tmp_code[i] + 0.5) * o_abs[i];
+                ipnorm += (value + 0.5) * o_abs[i];
             }
 
             T ipnorm_inv = static_cast<double>(1 / ipnorm); // 1 / (ip*norm)
