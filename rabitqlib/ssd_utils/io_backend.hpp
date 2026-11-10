@@ -17,7 +17,7 @@
 #include <cstdint>
 #include <cstring>
 
-#include "rabitqlib/ssd_utils/ssd_index_defs.hpp" // IO_QUEUE_DEPTH, crash()
+#include "rabitqlib/ssd_utils/ssd_index_defs.hpp" // kMaxReadsInFlight, crash()
 #include "rabitqlib/ssd_utils/log.hpp"
 
 #include <libaio.h>
@@ -68,8 +68,8 @@ struct SubmitBatch
 {
     void *ctx_ = nullptr;
     int n_ = 0;
-    struct iocb cbs_[IO_QUEUE_DEPTH];
-    struct iocb *ptrs_[IO_QUEUE_DEPTH];
+    struct iocb cbs_[kMaxReadsInFlight];
+    struct iocb *ptrs_[kMaxReadsInFlight];
 
     inline void begin(void *ctx)
     {
@@ -80,7 +80,7 @@ struct SubmitBatch
     inline bool stage(int fd, void *buf, unsigned len, uint64_t offset,
                       void *user_data)
     {
-        if (n_ >= IO_QUEUE_DEPTH)
+        if (n_ >= static_cast<int>(kMaxReadsInFlight))
         {
             return false;
         }
@@ -135,11 +135,11 @@ inline SubmitBatch &submit_batch()
 // negative errno. Returns the number reaped (>=0); 0 means nothing ready.
 inline int reap_batch(void *ctx, void **user_data_out, int *res_out, int max)
 {
-    if (max > IO_QUEUE_DEPTH)
+    if (max > static_cast<int>(kMaxReadsInFlight))
     {
-        max = IO_QUEUE_DEPTH;
+        max = static_cast<int>(kMaxReadsInFlight);
     }
-    static thread_local struct io_event evs[IO_QUEUE_DEPTH];
+    static thread_local struct io_event evs[kMaxReadsInFlight];
     struct timespec zero{0, 0}; // non-blocking poll
     const int ret =
         io_getevents(reinterpret_cast<io_context_t>(ctx), 0, max, evs, &zero);

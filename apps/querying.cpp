@@ -20,12 +20,12 @@
 #include "rabitqlib/utils/io_auto.hpp"
 #include "rabitqlib/utils/stopw.hpp"
 #include "rabitqlib/utils/tools.hpp"
-#include "rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms.hpp"
+#include "rabitqlib/index/ivf/ivf_ssd.hpp"
 #include <iomanip>
 
 using PID = rabitqlib::PID;
-using index_type = rabitqlib::ivf_ssd_boundary_qd_ms::IVFSSD_Index;
-using SearchStats = rabitqlib::ivf_ssd_boundary_qd_ms::SearchStats;
+using index_type = rabitqlib::ivf_ssd::IvfSsdIndex;
+using SearchStats = rabitqlib::ivf_ssd::SearchStats;
 using data_type = rabitqlib::RowMajorArray<float>;
 using gt_type = rabitqlib::RowMajorArray<PID>;
 using gt_dist_type = rabitqlib::RowMajorArray<float>;
@@ -357,7 +357,7 @@ static double avg_per_query(const std::vector<SearchStats> &stats, Getter get)
 // Per-query average of `stats[i].centroid_exbits_refines`. For IRQ this
 // counts how many first-level centroids the inner-IVF coarse step ran
 // `split_distance_boosting` on per query — i.e. the survivors of the
-// `lower_dist < distk` low-bound prune in scan_one_batch. Each such call
+// `lower_dist < threshold` low-bound prune in scan_batch. Each such call
 // costs O(padded_dim) for the ex-code SIMD inner product, so this counter
 // tracks the coarse-step cost that grows with nprobe.
 static double compute_avg_centroid_exbits_refines(
@@ -667,7 +667,7 @@ int main(int argc, char **argv)
         return 1;
     }
     ivf_ssd.load_coarse(coarse_index_file);
-    ivf_ssd.init_buffers(nthreads, topk);
+    ivf_ssd.init_buffers(nthreads);
     // Apply the drain-phase alpha before any search runs, so the get_nprobes
     // recall probing below already reflects it.
     ivf_ssd.set_drain_alpha(drain_alpha);
@@ -1148,9 +1148,9 @@ int main(int argc, char **argv)
     }
 
     // ---- Scan-phase bookkeeping analysis (avg per query) ----
-    // Bookkeeping cost grows as the cluster count shrinks: a large cluster
-    // shares a single per-cluster distk, so the in-memory prune is weak and
-    // more points reach the candidate pool. Column meanings:
+    // The pruning threshold is the k-th distance, recomputed for every
+    // 32-vector batch. In a large cluster, many points are scanned before
+    // completed re-ranks lower it, so more become candidates. Column meanings:
     // cand_inserted/probed = in-memory prune pass rate;
     // cand_inserted/iopages = inserted candidates discarded before SSD re-rank
     // (wasted insertion work); peak_slots = per-thread candidate-pool

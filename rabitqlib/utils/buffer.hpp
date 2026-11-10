@@ -106,5 +106,9 @@ class SearchBuffer {
     const std::vector<AnnCandidate<T>, memory::AlignedAllocator<AnnCandidate<T>>>& data() {
         return data_;
     }
+
+    const std::vector<AnnCandidate<T>, memory::AlignedAllocator<AnnCandidate<T>>>& data() const {
+        return data_;
+    }
 };
 }  // namespace rabitqlib::buffer

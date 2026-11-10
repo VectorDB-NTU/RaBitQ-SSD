@@ -56,7 +56,8 @@ void LinuxAlignedFileReader::register_thread()
 {
     if (ioctx::ctx == nullptr)
     {
-        ioctx::ctx = rabitqlib::io_backend::ctx_create(MAX_EVENTS);
+        ioctx::ctx = rabitqlib::io_backend::ctx_create(
+            static_cast<unsigned>(kMaxReadsInFlight));
         if (ioctx::ctx == nullptr)
         {
             LOG(ERROR) << "io_backend ctx_create (" << rabitqlib::io_backend::name()

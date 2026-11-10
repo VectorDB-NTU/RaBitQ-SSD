@@ -6,21 +6,19 @@
 
 // Device sector size. O_DIRECT requires every read offset, length and buffer
 // address to be a multiple of this value; the on-disk index is laid out in
-// pages of exactly SECTOR_LEN bytes.
+// pages of SECTOR_LEN (4 KiB) bytes.
 constexpr size_t SECTOR_LEN = 4096;
 
-// Pages the index build fills into one buffer before issuing a single pwrite.
-// Writing 1024 pages (4 MiB) at a time into a preallocated file keeps the
-// parallel writers from serializing on the file system; the bytes written do
-// not depend on this value.
+// 4 KiB pages the index build fills into one buffer before a single pwrite.
+// The build buffers 1024 pages (4 MiB) per pwrite to <base>.ssd so parallel
+// writers do not serialize on the file system. The bytes written do not
+// depend on this value.
 constexpr size_t kSsdWriteChunkPages = 1024;
 
-// Maximum number of reads a single thread may keep in flight. It sizes the
-// reader's event limit (MAX_EVENTS), the libaio queue (io_setup nr_events) and
-// the per-query request-slot count (N_REQ_BUF), which must all stay equal:
-// staging more than IO_QUEUE_DEPTH requests in one submit round is a fatal
-// error.
-constexpr int IO_QUEUE_DEPTH = 200;
+// Maximum reads in flight per thread. Sizes the libaio context, submission
+// and completion arrays, and per-query request slots. Staging more than
+// kMaxReadsInFlight reads in one submit round is a fatal error.
+constexpr size_t kMaxReadsInFlight = 200;
 
 #ifndef unlikely
 #define unlikely(x) __builtin_expect(!!(x), 0)

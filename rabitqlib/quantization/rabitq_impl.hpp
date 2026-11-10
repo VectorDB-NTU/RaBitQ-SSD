@@ -241,7 +241,7 @@ namespace rabitqlib::quant::rabitq_impl
             size_t padded_dim,
             TC *compact_code,
             T &f_add,
-            T &f_recale,
+            T &f_rescale,
             T &f_error,
             MetricType metric_type = METRIC_L2)
         {
@@ -255,7 +255,7 @@ namespace rabitqlib::quant::rabitq_impl
                 padded_dim,
                 binary_code.data(),
                 f_add,
-                f_recale,
+                f_rescale,
                 f_error,
                 metric_type);
 
@@ -301,7 +301,7 @@ namespace rabitqlib::quant::rabitq_impl
             size_t padded_dim,
             uint8_t *packed_code,
             T *f_add,
-            T *f_recale,
+            T *f_rescale,
             T *f_error,
             MetricType metric_type = METRIC_L2)
         {
@@ -314,7 +314,7 @@ namespace rabitqlib::quant::rabitq_impl
                 padded_dim,
                 compact_codes.data(),
                 f_add,
-                f_recale,
+                f_rescale,
                 f_error,
                 metric_type);
             fastscan::pack_codes(padded_dim, compact_codes.data(), num, packed_code);

@@ -75,8 +75,8 @@ constexpr uint32_t kSchemeMean = 0U;
 //              work predictably without a per-dataset points budget, which
 //              matters on ~100M datasets where the coarse step dominates.
 //
-// Refinement method used inside scan_one_batch when a centroid passes the
-// 1-bit lower-bound prune (low_dist < distk). The 1-bit fastscan stage is
+// Refinement method used inside scan_batch when a centroid passes the
+// 1-bit lower-bound prune (low_dist < threshold). The 1-bit fastscan stage is
 // always done first either way; this only controls the per-survivor refine.
 //
 //   Exbits        : default. split_distance_boosting on the 8-bit ex_code
@@ -220,12 +220,11 @@ class MaxHeapTopK {
 
 class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
    public:
-    // Indexing-time ctor. IVFSSD_Index supplies the outer rotator — which
-    // maps the original-space second-level centroids loaded from disk into
-    // the same padded_dim space the rotated first-level centroids live in —
-    // and the paths to the python-produced inner-centroids / inner-cluster-
-    // ids. All input paths accept either .fvecs/.ivecs or .fbin/.bin
-    // (auto-detected).
+    // build_coarse_quantizer passes the inner-centroid and inner-cluster-id
+    // paths. The outer rotator maps second-level centroids into the padded
+    // space of the rotated first-level centroids. Paths accept .fvecs/.ivecs
+    // or .fbin/.bin (auto-detected). load_coarse passes empty paths, and
+    // load() reads the .irq sidecar.
     IvfRabitqInitializer(size_t padded_dim,
                          size_t num_cluster,
                          size_t outer_dim,
@@ -246,15 +245,6 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
                   << (ip_normalize_ ? "true" : "false") << "\n";
     }
 
-    // Loading-time ctor. Inner index payload is read from the .irq sidecar
-    // in load(); no outer rotator / paths needed.
-    IvfRabitqInitializer(size_t padded_dim, size_t num_cluster)
-        : Initializer(padded_dim, num_cluster),
-          search_params_(load_search_params_from_env()) {
-        ip_func_ = select_excode_ipfunc(kInnerExBits);
-        announce_search_params();
-    }
-
     ~IvfRabitqInitializer() override {
         std::free(batch_data_);
         std::free(ex_data_);
@@ -263,7 +253,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
     // Returns the (rotated, padded_dim) first-level centroid by id. In
     // ip_normalize_ mode this is the *normalized* (unit-norm) centroid, which
     // the outer SSD loop does not read for METRIC_IP: it reconstructs <q,c>
-    // from centroid_norm(id) and dist_IRQ instead (see common.tpp).
+    // from centroid_norm(id) and dist_IRQ instead (see ivf_ssd.tpp).
     [[nodiscard]] const float* centroid(PID id) const override {
         return rotated_centroids_.data() + (static_cast<size_t>(id) * dim_);
     }
@@ -276,11 +266,11 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
         return centroid_norms_[static_cast<size_t>(id)];
     }
 
-    // Build the embedded IVF-RaBitQ. Called by IVFSSD_Index::construct after
-    // it has rotated the first-level centroids; the rotated centroids are
-    // passed in here. Loads the python-generated second-level centroids from
-    // disk, rotates them with the outer rotator, then quantizes the
-    // first-level centroids relative to their assigned second-level centroid.
+    // Build the embedded IVF-RaBitQ. IvfSsdIndex::build_coarse_quantizer
+    // passes the rotated first-level centroids here. Loads the python-generated
+    // second-level centroids from disk, rotates them with the outer rotator,
+    // then quantizes the first-level centroids relative to their assigned
+    // second-level centroid.
     void add_vectors(const float* rotated_centroids) override {
         if (outer_rotator_ == nullptr) {
             throw std::runtime_error(
@@ -492,9 +482,9 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
 
         // 2) Order inner clusters by ascending query-to-inner-centroid
         //    distance (nearest first). This matters even in Full mode: the
-        //    top-K bound distk shrinks as candidates accumulate, so visiting
-        //    near clusters first makes far clusters' survivors face a tighter
-        //    distk and be pruned before the ex-bits rerank (fewer
+        //    top-K bound threshold shrinks as candidates accumulate, so
+        //    visiting near clusters first makes far clusters' survivors face a
+        //    tighter threshold and be pruned before the ex-bits rerank (fewer
         //    split_distance_boosting calls). It is also what makes the
         //    KFixedMult "stop after k clusters" cap meaningful.
         std::vector<uint32_t> order(num_inner_cluster_);
@@ -567,16 +557,16 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
             const size_t remain = n - (iter * fastscan::kBatchSize);
 
             for (size_t b = 0; b < iter; ++b) {
-                scan_one_batch(batch_ptr, ex_ptr, ids, q_obj,
-                               fastscan::kBatchSize, knns,
-                               fastscan_attempts, exbits_refines);
+                scan_batch(batch_ptr, ex_ptr, ids, q_obj,
+                           fastscan::kBatchSize, knns,
+                           fastscan_attempts, exbits_refines);
                 batch_ptr += batch_block_bytes;
                 ex_ptr += fastscan::kBatchSize * ex_one_bytes;
                 ids += fastscan::kBatchSize;
             }
             if (remain > 0) {
-                scan_one_batch(batch_ptr, ex_ptr, ids, q_obj, remain, knns,
-                               fastscan_attempts, exbits_refines);
+                scan_batch(batch_ptr, ex_ptr, ids, q_obj, remain, knns,
+                           fastscan_attempts, exbits_refines);
             }
         }
 
@@ -587,7 +577,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
         // 5) Sort the heap and copy out top-nprobe in ascending-distance
         //    order. knns stores ex_dist = RaBitQ's estimate of *squared* L2
         //    distance (sqrt is monotonic so ranking is preserved). The
-        //    downstream boundary_qd loop expects the same convention as
+        //    downstream search_one loop expects the same convention as
         //    Flat/HNSW initializers — distance = sqrt(squared_dist), i.e.
         //    an L2 *norm* — because it later calls set_g_add(dist), which
         //    itself squares the input. Returning a squared distance here
@@ -821,14 +811,14 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
     }
 
    private:
-    void scan_one_batch(const char* batch_data,
-                        const char* ex_data,
-                        const CID* ids,
-                        const SplitBatchQuery<float>& q_obj,
-                        size_t num_points,
-                        MaxHeapTopK& knns,
-                        uint64_t& fastscan_attempts,
-                        uint64_t& exbits_refines) const {
+    void scan_batch(const char* batch_data,
+                    const char* ex_data,
+                    const CID* ids,
+                    const SplitBatchQuery<float>& q_obj,
+                    size_t num_points,
+                    MaxHeapTopK& knns,
+                    uint64_t& fastscan_attempts,
+                    uint64_t& exbits_refines) const {
         std::array<float, fastscan::kBatchSize> est_distance;
         std::array<float, fastscan::kBatchSize> low_distance;
         std::array<float, fastscan::kBatchSize> ip_x0_qr;
@@ -837,7 +827,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
                             low_distance.data(), ip_x0_qr.data(),
                             /*use_hacc=*/true);
 
-        float distk = knns.top_dist();
+        float threshold = knns.top_dist();
         // Hoist the refine mode out of the inner loop to keep the branch
         // predictable.
         const bool use_full_prec =
@@ -848,7 +838,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
         for (size_t i = 0; i < num_points; ++i) {
             ++fastscan_attempts;
             const float lower_dist = low_distance[i];
-            if (lower_dist < distk) {
+            if (lower_dist < threshold) {
                 float ex_dist;
                 if (use_full_prec) {
                     // Pure SIMD-FMA exact squared L2 in padded_dim space.
@@ -869,7 +859,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
                 }
                 ++exbits_refines;
                 knns.insert(ids[i], ex_dist);
-                distk = knns.top_dist();
+                threshold = knns.top_dist();
             }
             ex_data += ExDataMap<float>::data_bytes(dim_, kInnerExBits);
         }

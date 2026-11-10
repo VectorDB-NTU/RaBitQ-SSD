@@ -15,8 +15,6 @@
 #include <cstdio>
 #include <fcntl.h>
 
-#define MAX_EVENTS IO_QUEUE_DEPTH
-
 // Owns the O_DIRECT file descriptor of the SSD index plus the per-thread IO
 // contexts (created lazily via get_ctx). The actual submit/reap hot path
 // lives in rabitqlib::io_backend (io_backend.hpp); this class only manages

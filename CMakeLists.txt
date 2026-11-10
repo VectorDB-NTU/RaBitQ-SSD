@@ -93,14 +93,12 @@ else()
     set(CMAKE_RUNTIME_OUTPUT_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR}/bin)
 endif()
 
-# Shared translation units linked into every executable.
-set(RABITQ_CORE_SRC      ${CMAKE_CURRENT_SOURCE_DIR}/src/ivf_ssd_boundary_qd_ms.cpp)
+# Shared translation unit linked into every executable.
 set(RABITQ_SSD_UTILS_SRC ${CMAKE_CURRENT_SOURCE_DIR}/src/ssd_utils/linux_aligned_file_reader.cpp)
 
 foreach(app build_invlist build_coarse querying)
     add_executable(${app}
         apps/${app}.cpp
-        ${RABITQ_CORE_SRC}
         ${RABITQ_SSD_UTILS_SRC})
     target_link_libraries(${app} PRIVATE rabitq_io)
     if(RABITQ_PID64)

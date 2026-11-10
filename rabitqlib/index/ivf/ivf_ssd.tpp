@@ -11,11 +11,11 @@
 #include <filesystem>
 #include <unordered_map>
 
-#include "rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms_common.hpp"
+#include "rabitqlib/index/ivf/ivf_ssd.hpp"
 #include "rabitqlib/utils/stopw.hpp"
 #include "rabitqlib/utils/streaming_reader.hpp"
 
-namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+namespace rabitqlib::ivf_ssd
 {
     inline void QueryBuffer::init_page_candidate_storage(
         size_t candidate_capacity, size_t initial_slots)
@@ -52,9 +52,9 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         for (size_t i = page_slots.size(); i > 0; --i)
         {
             const SlotID slot_id = static_cast<SlotID>(i - 1);
-            PageCandidates &slot = page_slots[slot_id];
+            PageCandidate &slot = page_slots[slot_id];
             slot.page_lower_bound = 0.0F;
-            slot.probe_idx = static_cast<CID>(-1);
+            slot.probe_idx = static_cast<uint32_t>(-1);
             slot.page_id = -1;
             slot.req_slot = -1;
             slot.candidate_num = 0;
@@ -62,31 +62,24 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
 
         free_req_slots.clear();
-        free_req_slots.reserve(N_REQ_BUF);
+        free_req_slots.reserve(kMaxReadsInFlight);
         completed_slots.clear();
-        for (int req_slot = static_cast<int>(N_REQ_BUF); req_slot > 0; --req_slot)
+        for (int req_slot = static_cast<int>(kMaxReadsInFlight);
+             req_slot > 0; --req_slot)
         {
             const int slot = req_slot - 1;
-            reqs[slot] = IORequest();
+            requests[slot] = IORequest();
             req_slot_owner[slot] = kSlotMax;
             free_req_slots.push_back(slot);
         }
     }
 
-    inline char *QueryBuffer::request_buffer(int req_slot) const
+    inline char *QueryBuffer::read_buffer(int req_slot) const
     {
-        return sector_scratch + static_cast<size_t>(req_slot) * request_slot_bytes;
+        return read_buffers + static_cast<size_t>(req_slot) * read_bytes;
     }
 
-    inline SingleCandidate *QueryBuffer::slot_candidates(SlotID slot_id)
-    {
-        assert(slot_id < page_slots.size());
-        return candidate_storage.data() +
-               static_cast<size_t>(slot_id) *
-                   static_cast<size_t>(page_candidate_capacity);
-    }
-
-    inline const SingleCandidate *QueryBuffer::slot_candidates(SlotID slot_id) const
+    inline Candidate *QueryBuffer::slot_candidates(SlotID slot_id)
     {
         assert(slot_id < page_slots.size());
         return candidate_storage.data() +
@@ -94,27 +87,31 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                    static_cast<size_t>(page_candidate_capacity);
     }
 
-    inline void ArrayPendingSet::reset()
+    inline const Candidate *QueryBuffer::slot_candidates(SlotID slot_id) const
+    {
+        assert(slot_id < page_slots.size());
+        return candidate_storage.data() +
+               static_cast<size_t>(slot_id) *
+                   static_cast<size_t>(page_candidate_capacity);
+    }
+
+    inline void PendingPages::reset()
     {
         entries_.clear();
         head_ = 0;
     }
 
-    inline void ArrayPendingSet::on_slot_grow(size_t)
-    {
-    }
-
-    inline bool ArrayPendingSet::empty() const
+    inline bool PendingPages::empty() const
     {
         return size() == 0;
     }
 
-    inline size_t ArrayPendingSet::size() const
+    inline size_t PendingPages::size() const
     {
         return entries_.size() - head_;
     }
 
-    inline void ArrayPendingSet::insert(SlotID slot_id, float key)
+    inline void PendingPages::insert(SlotID slot_id, float key)
     {
         compact_if_needed();
         const auto begin_it = entries_.begin() + static_cast<ptrdiff_t>(head_);
@@ -125,25 +122,25 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         entries_.insert(it, Entry{slot_id, key});
     }
 
-    inline SlotID ArrayPendingSet::front_slot() const
+    inline SlotID PendingPages::front_slot() const
     {
         assert(!empty());
         return entries_[head_].slot_id;
     }
 
-    inline void ArrayPendingSet::pop_front()
+    inline void PendingPages::pop_front()
     {
         assert(!empty());
         ++head_;
         compact_if_needed();
     }
 
-    inline void ArrayPendingSet::prune_greater(float distk,
-                                               std::vector<SlotID> &pruned_slots)
+    inline void PendingPages::prune_greater(float threshold,
+                                            std::vector<SlotID> &pruned_slots)
     {
         const auto begin_it = entries_.begin() + static_cast<ptrdiff_t>(head_);
         const auto it = std::upper_bound(
-            begin_it, entries_.end(), distk,
+            begin_it, entries_.end(), threshold,
             [](float value, const Entry &entry)
             { return value < entry.key; });
         for (auto cur = it; cur != entries_.end(); ++cur)
@@ -160,7 +157,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         compact_if_needed();
     }
 
-    inline void ArrayPendingSet::compact_if_needed()
+    inline void PendingPages::compact_if_needed()
     {
         if (head_ == 0)
         {
@@ -175,8 +172,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     }
 
 
-    template <class PendingSet>
-    inline void PageCandidate_IO_Queue<PendingSet>::ensure_slot_capacity(
+    inline void PageReadQueue::ensure_slot_capacity(
         size_t target_slots)
     {
         if (slot_state_.size() >= target_slots)
@@ -185,38 +181,41 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
         slot_state_.resize(target_slots, kStateFree);
         slot_req_slot_.resize(target_slots, kInvalidReqSlot);
-        pending_.on_slot_grow(target_slots);
     }
 
-    template <class PendingSet>
-    inline void PageCandidate_IO_Queue<PendingSet>::reset(QueryBuffer *query_buf)
+    inline void PageReadQueue::reset(
+        QueryBuffer *query_buf, LinuxAlignedFileReader *file_reader,
+        void *ctx, bool empty_ssd, SearchStats *stats)
     {
+        query_buf_ = query_buf;
+        file_reader_ = file_reader;
+        ctx_ = ctx;
+        empty_ssd_ = empty_ssd;
+        stats_ = stats;
         pending_.reset();
         ready_completed_.clear();
         inflight_count_ = 0;
-        ensure_slot_capacity(query_buf->page_slots.size());
+        ensure_slot_capacity(query_buf_->page_slots.size());
         std::fill(slot_state_.begin(), slot_state_.end(), kStateFree);
         std::fill(slot_req_slot_.begin(), slot_req_slot_.end(), kInvalidReqSlot);
     }
 
-    template <class PendingSet>
-    inline SlotID PageCandidate_IO_Queue<PendingSet>::acquire_page_candidate_slot(
-        QueryBuffer *query_buf)
+    inline SlotID PageReadQueue::acquire_page_slot()
     {
-        if (query_buf->free_page_slots.empty())
+        if (query_buf_->free_page_slots.empty())
         {
-            const size_t old_size = query_buf->page_slots.size();
+            const size_t old_size = query_buf_->page_slots.size();
             const size_t grow_by =
-                std::max(old_size, static_cast<size_t>(INITIAL_PAGE_SLOT_CAPACITY));
-            query_buf->ensure_page_slot_capacity(old_size + grow_by);
-            ensure_slot_capacity(query_buf->page_slots.size());
+                std::max(old_size, static_cast<size_t>(kInitialPageSlots));
+            query_buf_->ensure_page_slot_capacity(old_size + grow_by);
+            ensure_slot_capacity(query_buf_->page_slots.size());
         }
 
-        const SlotID slot_id = query_buf->free_page_slots.back();
-        query_buf->free_page_slots.pop_back();
-        PageCandidates &slot = query_buf->page_slots[slot_id];
+        const SlotID slot_id = query_buf_->free_page_slots.back();
+        query_buf_->free_page_slots.pop_back();
+        PageCandidate &slot = query_buf_->page_slots[slot_id];
         slot.page_lower_bound = 0.0F;
-        slot.probe_idx = static_cast<CID>(-1);
+        slot.probe_idx = static_cast<uint32_t>(-1);
         slot.page_id = -1;
         slot.req_slot = -1;
         slot.candidate_num = 0;
@@ -224,85 +223,71 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         return slot_id;
     }
 
-    template <class PendingSet>
-    inline void PageCandidate_IO_Queue<PendingSet>::release_page_slot(
-        QueryBuffer *query_buf, SlotID slot_id)
+    inline void PageReadQueue::release_page_slot(SlotID slot_id)
     {
-        assert(slot_id < query_buf->page_slots.size());
-        PageCandidates &slot = query_buf->page_slots[slot_id];
+        assert(slot_id < query_buf_->page_slots.size());
+        PageCandidate &slot = query_buf_->page_slots[slot_id];
         slot.page_lower_bound = 0.0F;
-        slot.probe_idx = static_cast<CID>(-1);
+        slot.probe_idx = static_cast<uint32_t>(-1);
         slot.page_id = -1;
         slot.req_slot = -1;
         slot.candidate_num = 0;
         slot_state_[slot_id] = kStateFree;
         slot_req_slot_[slot_id] = kInvalidReqSlot;
-        query_buf->free_page_slots.push_back(slot_id);
+        query_buf_->free_page_slots.push_back(slot_id);
     }
 
-    template <class PendingSet>
-    inline void PageCandidate_IO_Queue<PendingSet>::prune_pending_above(
-        QueryBuffer *query_buf, float distk)
+    inline void PageReadQueue::prune_pending_above(float threshold)
     {
         if (pending_.empty())
         {
             return;
         }
-        std::vector<SlotID> pruned_slots;
-        pruned_slots.reserve(pending_.size());
-        pending_.prune_greater(distk, pruned_slots);
-        for (SlotID slot_id : pruned_slots)
+        pruned_slots_.clear();
+        pruned_slots_.reserve(pending_.size());
+        pending_.prune_greater(threshold, pruned_slots_);
+        for (SlotID slot_id : pruned_slots_)
         {
             assert(slot_state_[slot_id] == kStatePending);
-            release_page_slot(query_buf, slot_id);
+            release_page_slot(slot_id);
         }
     }
 
-    template <class PendingSet>
-    inline int PageCandidate_IO_Queue<PendingSet>::push_into_submit_candidate_pool(
-        SlotID slot_id, float page_lower_bound, SearchStats *)
+    inline void PageReadQueue::enqueue_page(SlotID slot_id)
     {
         assert(slot_id < slot_state_.size());
         assert(slot_state_[slot_id] == kStateReserved ||
                slot_state_[slot_id] == kStateFree);
         slot_state_[slot_id] = kStatePending;
-        pending_.insert(slot_id, page_lower_bound);
-        return -1;
+        pending_.insert(slot_id, query_buf_->page_slots[slot_id].page_lower_bound);
     }
 
-    template <class PendingSet>
-    inline void PageCandidate_IO_Queue<PendingSet>::prepare_request(
-        QueryBuffer *query_buf, SlotID slot_id, int req_slot)
+    inline void PageReadQueue::prepare_read(SlotID slot_id, int req_slot)
     {
-        PageCandidates &cand = query_buf->page_slots[slot_id];
-        char *buf = query_buf->request_buffer(req_slot);
-        query_buf->reqs[req_slot] = IORequest(
+        PageCandidate &cand = query_buf_->page_slots[slot_id];
+        char *buf = query_buf_->read_buffer(req_slot);
+        query_buf_->requests[req_slot] = IORequest(
             static_cast<uint64_t>(cand.page_id) * SECTOR_LEN,
-            query_buf->request_slot_bytes, buf);
-        query_buf->req_slot_owner[req_slot] = slot_id;
+            query_buf_->read_bytes, buf);
+        query_buf_->req_slot_owner[req_slot] = slot_id;
         cand.req_slot = req_slot;
         slot_req_slot_[slot_id] = req_slot;
     }
 
-    template <class PendingSet>
-    template <bool LimitByCandidateCount>
-    inline int PageCandidate_IO_Queue<PendingSet>::submit_impl(
-        size_t budget, QueryBuffer *query_buf,
-        LinuxAlignedFileReader *file_reader, void *ctx, float distk,
-        bool empty_ssd, SearchStats *stats)
+    inline int PageReadQueue::submit_reads(size_t budget, float threshold)
     {
         if (budget == 0 || pending_.empty())
         {
             return 0;
         }
 
-        prune_pending_above(query_buf, distk);
+        prune_pending_above(threshold);
         if (budget == 0 || pending_.empty())
         {
             return 0;
         }
 
-        if (empty_ssd)
+        if (empty_ssd_)
         {
             while (budget > 0 && !pending_.empty())
             {
@@ -310,49 +295,39 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 pending_.pop_front();
                 slot_state_[slot_id] = kStateCompleted;
                 ready_completed_.push_back(slot_id);
-                if constexpr (LimitByCandidateCount)
-                {
-                    const size_t n_cands =
-                        query_buf->page_slots[slot_id].candidate_num;
-                    budget = (budget > n_cands) ? (budget - n_cands) : 0;
-                }
-                else
-                {
-                    --budget;
-                }
+                --budget;
             }
             return 0;
         }
 
         rabitqlib::io_backend::SubmitBatch &io_batch =
             rabitqlib::io_backend::submit_batch();
-        io_batch.begin(ctx);
+        io_batch.begin(ctx_);
         int submitted = 0;
         while (budget > 0 && !pending_.empty() &&
-               !query_buf->free_req_slots.empty())
+               !query_buf_->free_req_slots.empty())
         {
             const SlotID slot_id = pending_.front_slot();
             pending_.pop_front();
 
-            const int req_slot = query_buf->free_req_slots.back();
-            query_buf->free_req_slots.pop_back();
-            prepare_request(query_buf, slot_id, req_slot);
+            const int req_slot = query_buf_->free_req_slots.back();
+            query_buf_->free_req_slots.pop_back();
+            prepare_read(slot_id, req_slot);
 
-            IORequest &req = query_buf->reqs[req_slot];
+            IORequest &req = query_buf_->requests[req_slot];
             const uint64_t end_offset = req.offset + req.len;
-            if (req.offset > file_reader->get_file_size() ||
-                end_offset > file_reader->get_file_size())
+            if (end_offset > file_reader_->get_file_size())
             {
                 LOG(ERROR) << "Read out of range: offset=" << req.offset
                            << ", len=" << req.len
-                           << ", file_sz=" << file_reader->get_file_size();
+                           << ", file_sz=" << file_reader_->get_file_size();
                 crash();
             }
 
             // Stage one read into the IO backend; libaio reads straight into
             // req.buf.
             if (!io_batch.stage(
-                    file_reader->get_file_desc(), req.buf,
+                    file_reader_->get_file_desc(), req.buf,
                     static_cast<unsigned>(req.len), req.offset, &req))
             {
                 LOG(ERROR) << "io_backend stage failed (submission queue full)";
@@ -362,25 +337,17 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             slot_state_[slot_id] = kStateInflight;
             inflight_count_++;
             submitted++;
-            if (stats != nullptr)
+            if (stats_ != nullptr)
             {
                 // Single submit chokepoint: count the request itself, the
-                // exact bytes, and the page-equivalent separately (a multi-
-                // page contiguous read is 1 req, N pages, len bytes).
-                stats->issued_read_reqs += 1;
-                stats->issued_read_pages += req.len / SECTOR_LEN;
-                stats->issued_read_bytes += req.len;
+                // exact bytes, and the 4 KiB pages separately (a contiguous
+                // read of N pages is 1 req, N pages, len bytes).
+                stats_->issued_read_reqs += 1;
+                stats_->issued_read_pages += req.len / SECTOR_LEN;
+                stats_->issued_read_bytes += req.len;
             }
 
-            if constexpr (LimitByCandidateCount)
-            {
-                const size_t n_cands = query_buf->page_slots[slot_id].candidate_num;
-                budget = (budget > n_cands) ? (budget - n_cands) : 0;
-            }
-            else
-            {
-                --budget;
-            }
+            --budget;
         }
 
         if (submitted == 0)
@@ -397,34 +364,15 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         return submitted;
     }
 
-    template <class PendingSet>
-    inline int PageCandidate_IO_Queue<PendingSet>::submit_top_io_pagecandidates(
-        size_t max_n_page_submit, QueryBuffer *query_buf,
-        LinuxAlignedFileReader *file_reader, void *ctx, float distk,
-        bool empty_ssd, SearchStats *stats)
+    inline void PageReadQueue::poll_reads()
     {
-        return submit_impl<false>(max_n_page_submit, query_buf, file_reader, ctx,
-                                  distk, empty_ssd, stats);
-    }
+        query_buf_->completed_slots.clear();
 
-    template <class PendingSet>
-    inline void
-    PageCandidate_IO_Queue<PendingSet>::poll_all_completed_out_of_order(
-        LinuxAlignedFileReader *, void *ctx, QueryBuffer *query_buf,
-        int &n_completed, bool empty_ssd, SearchStats *)
-    {
-        if (n_completed >= static_cast<int>(N_REQ_BUF))
-        {
-            return;
-        }
-        query_buf->completed_slots.clear();
-
-        if (empty_ssd)
+        if (empty_ssd_)
         {
             for (SlotID slot_id : ready_completed_)
             {
-                query_buf->completed_slots.push_back(slot_id);
-                ++n_completed;
+                query_buf_->completed_slots.push_back(slot_id);
             }
             ready_completed_.clear();
             return;
@@ -435,10 +383,10 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             return;
         }
 
-        static thread_local void *io_ud[MAX_EVENTS];
-        static thread_local int io_res[MAX_EVENTS];
-        const int ret =
-            rabitqlib::io_backend::reap_batch(ctx, io_ud, io_res, MAX_EVENTS);
+        static thread_local void *io_ud[kMaxReadsInFlight];
+        static thread_local int io_res[kMaxReadsInFlight];
+        const int ret = rabitqlib::io_backend::reap_batch(
+            ctx_, io_ud, io_res, static_cast<int>(kMaxReadsInFlight));
         if (ret <= 0)
         {
             return;
@@ -448,8 +396,8 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         {
             // A failed or short read leaves stale bytes in the request buffer,
             // and re-ranking them would silently return wrong neighbours, so
-            // both are fatal. The SSD index is written in whole pages, so a
-            // good read always returns exactly req->len bytes.
+            // both are fatal. The SSD index is written in whole 4 KiB pages,
+            // so a good read always returns exactly req->len bytes.
             if (io_res[i] < 0)
             {
                 LOG(ERROR) << "SSD read failed: " << strerror(-io_res[i]);
@@ -469,14 +417,14 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 crash();
             }
 
-            const ptrdiff_t diff = req - query_buf->reqs.data();
-            if (diff < 0 || diff >= static_cast<ptrdiff_t>(N_REQ_BUF))
+            const ptrdiff_t diff = req - query_buf_->requests.data();
+            if (diff < 0 || diff >= static_cast<ptrdiff_t>(kMaxReadsInFlight))
             {
                 continue;
             }
 
             const int req_slot = static_cast<int>(diff);
-            const SlotID slot_id = query_buf->req_slot_owner[req_slot];
+            const SlotID slot_id = query_buf_->req_slot_owner[req_slot];
             if (slot_id == kSlotMax || slot_id >= slot_state_.size() ||
                 slot_state_[slot_id] != kStateInflight)
             {
@@ -485,17 +433,14 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
             slot_state_[slot_id] = kStateCompleted;
             inflight_count_--;
-            query_buf->completed_slots.push_back(slot_id);
-            ++n_completed;
+            query_buf_->completed_slots.push_back(slot_id);
         }
 
         // reap_batch already consumed the completions (io_getevents drains
         // them as they are returned).
     }
 
-    template <class PendingSet>
-    inline const char *PageCandidate_IO_Queue<PendingSet>::completed_data(
-        const QueryBuffer *query_buf, SlotID slot_id) const
+    inline const char *PageReadQueue::read_data(SlotID slot_id) const
     {
         if (slot_id >= slot_req_slot_.size())
         {
@@ -506,12 +451,10 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         {
             return nullptr;
         }
-        return static_cast<const char *>(query_buf->reqs[req_slot].buf);
+        return static_cast<const char *>(query_buf_->requests[req_slot].buf);
     }
 
-    template <class PendingSet>
-    inline void PageCandidate_IO_Queue<PendingSet>::release_completed_slot(
-        QueryBuffer *query_buf, SlotID slot_id)
+    inline void PageReadQueue::release_read(SlotID slot_id)
     {
         assert(slot_id < slot_state_.size());
         assert(slot_state_[slot_id] == kStateCompleted);
@@ -519,39 +462,33 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         const int req_slot = slot_req_slot_[slot_id];
         if (req_slot != kInvalidReqSlot)
         {
-            assert(query_buf->req_slot_owner[req_slot] == slot_id);
-            query_buf->reqs[req_slot] = IORequest();
-            query_buf->req_slot_owner[req_slot] = kSlotMax;
-            query_buf->free_req_slots.push_back(req_slot);
+            assert(query_buf_->req_slot_owner[req_slot] == slot_id);
+            query_buf_->requests[req_slot] = IORequest();
+            query_buf_->req_slot_owner[req_slot] = kSlotMax;
+            query_buf_->free_req_slots.push_back(req_slot);
         }
 
-        release_page_slot(query_buf, slot_id);
+        release_page_slot(slot_id);
     }
 
-    template <class PendingSet>
-    inline IVFSSD_Index<PendingSet>::IVFSSD_Index(
+    inline IvfSsdIndex::IvfSsdIndex(
         size_t num, size_t dim, size_t num_cluster, size_t total_bits,
         std::string ssd_index_file, MetricType metric_type, RotatorType type,
-        size_t mem_dim, CoarseKind coarse_kind,
-        ivf::InitializerType initializer_type,
-        std::string inner_centroids_path, std::string inner_cids_path)
+        size_t mem_dim)
         : num_(num),
           dim_(dim),
           requested_mem_dim_(mem_dim),
           num_cluster_(num_cluster),
           ex_bits_(total_bits - 1),
-          coarse_kind_(coarse_kind),
-          initializer_type_(
-              ivf::resolve_initializer_type(initializer_type, num_cluster)),
-          inner_centroids_path_(std::move(inner_centroids_path)),
-          inner_cids_path_(std::move(inner_cids_path)),
+          initializer_type_(ivf::resolve_initializer_type(
+              ivf::InitializerType::Auto, num_cluster)),
           type_(type),
           metric_type_(metric_type),
           ssd_index_file_(std::move(ssd_index_file))
     {
         if (total_bits < 1 || ex_bits_ > 8)
         {
-            std::cerr << "Invalid number of bits for quantization in IVFSSD_Index\n";
+            std::cerr << "Invalid number of bits for quantization in IvfSsdIndex\n";
             std::cerr << "Expected: 1 to 9  Input:" << total_bits << '\n';
             std::cerr.flush();
             std::exit(1);
@@ -567,8 +504,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         init_layout_metadata();
     }
 
-    template <class PendingSet>
-    inline IVFSSD_Index<PendingSet>::~IVFSSD_Index()
+    inline IvfSsdIndex::~IvfSsdIndex()
     {
         free_memory();
         delete rotator_;
@@ -580,9 +516,8 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         destroy_buffers();
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::set_ssd_store(SsdStore store,
-                                                        VecElemType raw_elem)
+    inline void IvfSsdIndex::set_ssd_store(SsdStore store,
+                                           VecElemType raw_elem)
     {
         ssd_store_ = store;
         raw_elem_ = raw_elem;
@@ -596,9 +531,8 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         log_ssd_layout();
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::write_raw_record(char *dst,
-                                                           const float *src) const
+    inline void IvfSsdIndex::write_raw_record(char *dst,
+                                              const float *src) const
     {
         if (raw_elem_ == VecElemType::F32)
         {
@@ -625,8 +559,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::read_base_store_fields(
+    inline void IvfSsdIndex::read_base_store_fields(
         std::istream &input, uint32_t version, const std::string &base_index_file)
     {
 #if defined(RABITQ_PID64)
@@ -685,18 +618,13 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::check_ssd_pages(
+    inline void IvfSsdIndex::check_ssd_pages(
         const std::vector<size_t> &cluster_sizes) const
     {
-        if (data_num_in_one_page_ == 0)
-        {
-            return;  // nothing is stored on SSD
-        }
         size_t pages = 0;
         for (const size_t n : cluster_sizes)
         {
-            pages += div_round_up(n, data_num_in_one_page_) * page_num_per_io_;
+            pages += div_round_up(n, records_per_read_) * pages_per_read_;
         }
         const auto limit = static_cast<size_t>(std::numeric_limits<PageIdx>::max());
         if (pages > limit)
@@ -708,8 +636,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::check_ssd_layout_searchable() const
+    inline void IvfSsdIndex::check_ssd_layout_searchable() const
     {
         if (ssd_store_ == SsdStore::ExBits && ex_bits_ == 0 && ssd_dim_ != 0)
         {
@@ -722,19 +649,18 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::preallocate_ssd_file(
+    inline void IvfSsdIndex::preallocate_ssd_file(
         uint64_t reserve_bytes)
     {
-        if (one_data_ssd_bytes_ == 0 || num_cluster_ == 0)
+        if (record_bytes_ == 0 || num_cluster_ == 0)
         {
             return;
         }
         const size_t last = num_cluster_ - 1;
         const uint64_t total_pages =
-            cluster_page_presums_[last] +
-            (div_round_up(cluster_lst_[last].num(), data_num_in_one_page_) *
-             page_num_per_io_);
+            cluster_first_page_[last] +
+            (div_round_up(cluster_lst_[last].num(), records_per_read_) *
+             pages_per_read_);
         const uint64_t total_bytes = total_pages * SECTOR_LEN;
         const int fd = file_reader_->get_file_desc();
         auto gb = [](uint64_t b) { return static_cast<double>(b) / 1e9; };
@@ -771,8 +697,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                   << std::strerror(errno);
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::init_layout_metadata()
+    inline void IvfSsdIndex::init_layout_metadata()
     {
         LOG(INFO) << "Initializing layout metadata...";
 
@@ -808,43 +733,45 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         if (ssd_store_ == SsdStore::Raw)
         {
             // The input vector, zero-padded to padded_dim.
-            one_data_ssd_bytes_ = padded_dim_ * elem_type_bytes(raw_elem_);
+            record_bytes_ = padded_dim_ * elem_type_bytes(raw_elem_);
         }
         else
         {
-            one_data_ssd_bytes_ =
+            record_bytes_ =
                 ssd_dim_ / 8 + ExDataMap<float>::data_bytes(padded_dim_, ex_bits_);
         }
 
-        if (one_data_ssd_bytes_ == 0)
+        if (record_bytes_ == 0)
         {
-            data_num_in_one_page_ =
-                std::min(fastscan::kBatchSize, DEFAULT_EMPTY_SSD_GROUP_SIZE);
-            page_num_per_io_ = 1;
+            // With no SSD records, this holds kEmptySsdGroupSize, the
+            // candidate group size.
+            records_per_read_ =
+                std::min(fastscan::kBatchSize, kEmptySsdGroupSize);
+            pages_per_read_ = 1;
         }
         else
         {
-            data_num_in_one_page_ =
+            records_per_read_ =
                 std::max(static_cast<size_t>(1),
-                         SECTOR_LEN / one_data_ssd_bytes_);
-            page_num_per_io_ = div_round_up(one_data_ssd_bytes_, SECTOR_LEN);
+                         SECTOR_LEN / record_bytes_);
+            pages_per_read_ = div_round_up(record_bytes_, SECTOR_LEN);
         }
+        read_bytes_ = SECTOR_LEN * pages_per_read_;
+        batch_bytes_ = BatchDataMap<float>::data_bytes(mem_dim_);
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::log_ssd_layout() const
+    inline void IvfSsdIndex::log_ssd_layout() const
     {
         LOG(INFO) << "SSD store: " << ssd_store_description() << ", "
-                  << one_data_ssd_bytes_ << " B per record, "
-                  << data_num_in_one_page_ << " per page, " << page_num_per_io_
-                  << " sector(s) per read";
+                  << record_bytes_ << " B per record, "
+                  << records_per_read_ << " record(s) per read, " << pages_per_read_
+                  << " page(s) per read";
     }
 
     // Allocate the coarse-quantizer-independent inverted-list buffers
     // (mem_batch_data_, ids_, ip_func_) required by build_invlist and
     // load_base. Does not touch initer_.
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::allocate_invlist_memory(
+    inline void IvfSsdIndex::allocate_invlist_memory(
         const std::vector<size_t> &cluster_sizes)
     {
         LOG(INFO) << "Allocating memory for inverted-list components...";
@@ -860,8 +787,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     // build_coarse_quantizer; on the load path those path strings are empty
     // and IvfRabitqInitializer::load reads the payload from the <coarse>.irq
     // sidecar instead.
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::build_initializer()
+    inline void IvfSsdIndex::build_initializer()
     {
         delete initer_;
         initer_ = nullptr;
@@ -872,8 +798,8 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             // embedded IVF-RaBitQ runs in normalized (unit-norm) space, so its
             // L2 cluster selection becomes cosine selection and the outer SSD
             // loop reconstructs <q,c> and ||q-c|| from the stored centroid
-            // norms (see the METRIC_IP branch of query_one_boundary_qd). For
-            // METRIC_L2 it stays false. Precondition on the build path: the
+            // norms (see the METRIC_IP branch of compute_probe_terms).
+            // For METRIC_L2 it stays false. Precondition on the build path: the
             // inner centroids must be computed on *normalized* first-level
             // centroids. On the load path the flag and the centroid norms are
             // restored from the .irq sidecar.
@@ -889,9 +815,8 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
     }
 
-    template <class PendingSet>
     inline void
-    IVFSSD_Index<PendingSet>::init_clusters(const std::vector<size_t> &cluster_sizes)
+    IvfSsdIndex::init_clusters(const std::vector<size_t> &cluster_sizes)
     {
         LOG(INFO) << "Initializing clusters...";
         size_t added_vectors = 0;
@@ -899,7 +824,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         size_t added_pages = 0;
 
         cluster_lst_.clear();
-        cluster_page_presums_.clear();
+        cluster_first_page_.clear();
 
         for (size_t i = 0; i < num_cluster_; ++i)
         {
@@ -907,27 +832,23 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             const size_t num_batches = div_round_up(num, fastscan::kBatchSize);
 
             char *current_batch_data =
-                mem_batch_data_ +
-                (BatchDataMap<float>::data_bytes(mem_dim_) * added_batches);
+                mem_batch_data_ + (batch_bytes_ * added_batches);
             PID *ids = ids_ + added_vectors;
 
-            ivf::Cluster cur_cluster(num, current_batch_data, nullptr, ids);
+            ivf::Cluster cur_cluster(num, current_batch_data, ids);
             cluster_lst_.push_back(std::move(cur_cluster));
 
-            cluster_page_presums_.emplace_back(added_pages);
+            cluster_first_page_.emplace_back(added_pages);
 
-            added_pages += data_num_in_one_page_
-                               ? div_round_up(num, data_num_in_one_page_) *
-                                     page_num_per_io_
-                               : 0;
+            added_pages += div_round_up(num, records_per_read_) *
+                           pages_per_read_;
             added_vectors += num;
             added_batches += num_batches;
         }
     }
 
-    template <class PendingSet>
     template <class FetchRow>
-    inline void IVFSSD_Index<PendingSet>::quantize_and_write_cluster_core(
+    inline void IvfSsdIndex::quantize_and_write_cluster_core(
         ivf::Cluster &cp, const PID *pids, size_t num_points,
         FetchRow fetch_row, const float *cur_centroid, float *rotated_centroid,
         const quant::RabitqConfig &config, size_t cluster_offset,
@@ -979,16 +900,14 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             const size_t i = b * fastscan::kBatchSize;
             const size_t n = std::min(fastscan::kBatchSize, num_points - i);
 
-            char *mem_batch_data_ptr =
-                mem_batch_data + b * BatchDataMap<float>::data_bytes(mem_dim_);
+            char *mem_batch_data_ptr = mem_batch_data + b * batch_bytes_;
             char *ssd_bin_data_ptr = ssd_bin_data_tmp + i * ssd_bytes_per_point;
             char *ex_data_ptr = ex_data_tmp + i * ex_bytes_per_point;
             // A short last batch leaves factor slots unwritten; zero the block
             // first so the base file does not depend on what memory held.
             if (n < fastscan::kBatchSize)
             {
-                std::memset(mem_batch_data_ptr, 0,
-                            BatchDataMap<float>::data_bytes(mem_dim_));
+                std::memset(mem_batch_data_ptr, 0, batch_bytes_);
             }
 
             quant::quantize_split_batch_ssd_split_single_uint64(
@@ -997,7 +916,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 ssd_bin_data_ptr, ex_data_ptr, metric_type_, config);
         }
 
-        if (one_data_ssd_bytes_ == 0)
+        if (record_bytes_ == 0)
         {
             std::free(ssd_bin_data_tmp);
             std::free(ex_data_tmp);
@@ -1005,27 +924,27 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
 
         // Write the cluster's SSD pages with pwrite(). Each cluster owns a
-        // fixed, contiguous, non-overlapping byte range; page p lands at
-        // cluster_offset + p*write_len, an absolute offset independent of the
+        // fixed, contiguous, non-overlapping byte range; read r lands at
+        // cluster_offset + r*write_len, an absolute offset independent of the
         // shared fd's position. So concurrent pwrite() from parallel cluster
         // workers (or, here, parallel chunks) is safe. Pages are written in
-        // chunks of kSsdWriteChunkPages; the bytes do not depend on the chunk
-        // size.
+        // chunks of kSsdWriteChunkPages 4 KiB pages; the bytes do not depend on
+        // the chunk size.
         const int ssd_fd = file_reader_->get_file_desc();
-        const size_t write_len = SECTOR_LEN * page_num_per_io_;
-        const size_t num_pages = div_round_up(num_points, data_num_in_one_page_);
-        const size_t pages_per_chunk =
-            std::max<size_t>(1, kSsdWriteChunkPages / page_num_per_io_);
-        const size_t num_chunks = div_round_up(num_pages, pages_per_chunk);
+        const size_t write_len = read_bytes_;
+        const size_t num_reads = div_round_up(num_points, records_per_read_);
+        const size_t reads_per_chunk =
+            std::max<size_t>(1, kSsdWriteChunkPages / pages_per_read_);
+        const size_t num_chunks = div_round_up(num_reads, reads_per_chunk);
 
 #pragma omp parallel for schedule(static) if (batch_parallel)
         for (size_t ch = 0; ch < num_chunks; ++ch)
         {
-            const size_t first_page = ch * pages_per_chunk;
-            const size_t pages_here =
-                std::min(pages_per_chunk, num_pages - first_page);
-            const size_t chunk_len = pages_here * write_len;
-            const size_t page_offset = cluster_offset + first_page * write_len;
+            const size_t first_read = ch * reads_per_chunk;
+            const size_t reads_here =
+                std::min(reads_per_chunk, num_reads - first_read);
+            const size_t chunk_len = reads_here * write_len;
+            const size_t page_offset = cluster_offset + first_read * write_len;
 
             char *page_buf =
                 memory::align_allocate<SECTOR_LEN, char, true>(chunk_len);
@@ -1037,31 +956,31 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             // bit-identical.
             std::memset(page_buf, 0, chunk_len);
 
-            for (size_t q = 0; q < pages_here; ++q)
+            for (size_t q = 0; q < reads_here; ++q)
             {
-                const size_t pid = (first_page + q) * data_num_in_one_page_;
-                const size_t points_in_page =
-                    std::min(data_num_in_one_page_, num_points - pid);
+                const size_t first_record = (first_read + q) * records_per_read_;
+                const size_t records_in_read =
+                    std::min(records_per_read_, num_points - first_record);
                 char *buf_ptr = page_buf + q * write_len;
-                for (size_t i = 0; i < points_in_page; ++i)
+                for (size_t i = 0; i < records_in_read; ++i)
                 {
                     if (ssd_store_ == SsdStore::Raw)
                     {
                         // fetch_row(k) is the k-th point in stored order, the
                         // same order as cp.ids(), before any rotation.
-                        write_raw_record(buf_ptr, fetch_row(pid + i));
-                        buf_ptr += one_data_ssd_bytes_;
+                        write_raw_record(buf_ptr, fetch_row(first_record + i));
+                        buf_ptr += record_bytes_;
                         continue;
                     }
                     std::memcpy(buf_ptr,
-                                ssd_bin_data_tmp + (pid + i) * (ssd_dim_ / 8),
+                                ssd_bin_data_tmp + (first_record + i) * (ssd_dim_ / 8),
                                 ssd_dim_ / 8);
                     buf_ptr += ssd_dim_ / 8;
 
                     const size_t ex_bytes =
                         ExDataMap<float>::data_bytes(padded_dim_, ex_bits_);
                     std::memcpy(buf_ptr,
-                                ex_data_tmp + (pid + i) * ex_bytes, ex_bytes);
+                                ex_data_tmp + (first_record + i) * ex_bytes, ex_bytes);
                     buf_ptr += ex_bytes;
                 }
             }
@@ -1096,8 +1015,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     // pid and store the same global pids into cp.ids(). Forwards to the shared
     // core with batch_parallel off, since construct_invlist already
     // parallelises over clusters.
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::quantize_and_write_clusterssd(
+    inline void IvfSsdIndex::quantize_and_write_clusterssd(
         ivf::Cluster &cp, const std::vector<PID> &ids, const float *data,
         const float *cur_centroid, float *rotated_centroid,
         const quant::RabitqConfig &config, size_t cluster_offset)
@@ -1110,10 +1028,9 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             /*batch_parallel=*/false);
     }
 
-    template <class PendingSet>
     template <class FetchRow>
     inline std::vector<size_t>
-    IVFSSD_Index<PendingSet>::compute_centroid_order(
+    IvfSsdIndex::compute_centroid_order(
         const PID *pids, size_t num_points, FetchRow fetch_row,
         const float *cur_centroid) const
     {
@@ -1169,8 +1086,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         return order;
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::quantize_and_write_ordered_clusterssd(
+    inline void IvfSsdIndex::quantize_and_write_ordered_clusterssd(
         ivf::Cluster &cp, const std::vector<PID> &ids, const float *data,
         const float *cur_centroid, float *rotated_centroid,
         const quant::RabitqConfig &config, size_t cluster_offset)
@@ -1208,8 +1124,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     // build_coarse_quantizer, so no vectors are fed to initer_ here; the
     // rotated centroids are cached in rotated_centroids_ so that save_base can
     // persist them for the coarse build to reuse.
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::construct_invlist(
+    inline void IvfSsdIndex::construct_invlist(
         const float *data, const float *centroids, const CID *assignments,
         bool faster, ClusterOrderMode order_mode)
     {
@@ -1261,7 +1176,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             const float *cur_centroid = centroids + (i * dim_);
             float *cur_rotated_c = &rotated_centroids_[i * padded_dim_];
             ivf::Cluster &cp = cluster_lst_[i];
-            const size_t cluster_offset = cluster_page_presums_[i] * SECTOR_LEN;
+            const size_t cluster_offset = cluster_first_page_[i] * SECTOR_LEN;
 
             if (order_mode == ClusterOrderMode::OrderedByCentroidDistance)
             {
@@ -1296,8 +1211,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     //       batches. Fills mem_batch_/ids_ + SSD pages at global offsets.
     //   P3  remove the scratch dir (caller then calls save_base).
     // -----------------------------------------------------------------------
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::construct_invlist_streaming(
+    inline void IvfSsdIndex::construct_invlist_streaming(
         const std::string &data_file, const float *centroids,
         const CID *assignments, bool faster, ClusterOrderMode order_mode,
         size_t mem_budget_bytes, size_t prefix_rows)
@@ -1419,10 +1333,10 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         // writes in parallel across chunks. Both need at most T buffers,
         // with the same chunk sizing as quantize_and_write_cluster_core.
         const size_t writer_buffer_bytes =
-            (one_data_ssd_bytes_ == 0)
+            (record_bytes_ == 0)
                 ? 0
-                : std::max<size_t>(1, kSsdWriteChunkPages / page_num_per_io_) *
-                      (SECTOR_LEN * page_num_per_io_);
+                : std::max<size_t>(1, kSsdWriteChunkPages / pages_per_read_) *
+                      read_bytes_;
         const size_t writer_reserve = T * writer_buffer_bytes;
         const size_t b_total = static_cast<size_t>(
             0.85 * static_cast<double>(mem_budget_bytes));
@@ -1830,7 +1744,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                     ivf::Cluster &cp = cluster_lst_[c];
                     const float *cur_centroid = centroids + c * dim_;
                     float *rc = &rotated_centroids_[c * padded_dim_];
-                    const size_t coff = cluster_page_presums_[c] * SECTOR_LEN;
+                    const size_t coff = cluster_first_page_[c] * SECTOR_LEN;
                     const auto &rows = loc_rows[k];
                     const size_t nc = rows.size();
                     if (order_mode ==
@@ -1873,7 +1787,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 ivf::Cluster &cp = cluster_lst_[c];
                 const float *cur_centroid = centroids + c * dim_;
                 float *rc = &rotated_centroids_[c * padded_dim_];
-                const size_t coff = cluster_page_presums_[c] * SECTOR_LEN;
+                const size_t coff = cluster_first_page_[c] * SECTOR_LEN;
                 std::vector<PID> pids(n);
                 for (size_t r = 0; r < n; ++r) pids[r] = meta[r].pid;
 
@@ -1922,8 +1836,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     // Persist the coarse-quantizer-independent base index. Layout (see
     // kBaseMagic comment): magic+version, metadata, cluster sizes, rotator,
     // rotated centroids, mem_batch_data, ids. No initializer payload.
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::save_base(
+    inline void IvfSsdIndex::save_base(
         const std::string &base_index_file)
     {
         LOG(INFO) << "Saving base index to " << base_index_file;
@@ -1999,8 +1912,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     // skipping the cluster-sizes block and stopping before mem_batch_data.
     // build_coarse uses this -- it needs neither the inverted list nor the
     // SSD file.
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::load_base_meta(
+    inline void IvfSsdIndex::load_base_meta(
         const std::string &base_index_file)
     {
         LOG(INFO) << "Loading base index header from " << base_index_file;
@@ -2063,8 +1975,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     // Build a coarse quantizer over the rotated centroids loaded from <base>:
     // set the coarse parameters, construct initer_, and feed it the centroids.
     // Precondition: load_base_meta() (or load_base()) has already run.
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::build_coarse_quantizer(
+    inline void IvfSsdIndex::build_coarse_quantizer(
         CoarseKind coarse_kind, ivf::InitializerType initializer_type,
         const std::string &inner_centroids_path,
         const std::string &inner_cids_path)
@@ -2099,8 +2010,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     // magic+version+kind, the base-pairing header, then the initializer
     // payload (Flat inline; HNSW/IRQ via a <coarse>.hnsw / <coarse>.irq
     // sidecar written by initer_->save).
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::save_coarse(
+    inline void IvfSsdIndex::save_coarse(
         const std::string &coarse_index_file)
     {
         LOG(INFO) << "Saving coarse quantizer to " << coarse_index_file;
@@ -2147,8 +2057,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     // Full base load for querying: metadata + rotator + rotated centroids +
     // mem_batch_data + ids, and opens <base>.ssd. The coarse quantizer is not
     // read here; load_coarse() loads it.
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::load_base(
+    inline void IvfSsdIndex::load_base(
         const std::string &base_index_file, const std::string &ssd_index_file,
         size_t mem_dim)
     {
@@ -2250,8 +2159,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     // load_base(): it validates that the coarse file pairs with this base
     // (matching num_cluster / dim / padded_dim / metric, and an FNV-1a
     // fingerprint of the rotated centroids) before constructing initer_.
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::load_coarse(
+    inline void IvfSsdIndex::load_coarse(
         const std::string &coarse_index_file)
     {
         LOG(INFO) << "Loading coarse quantizer from " << coarse_index_file;
@@ -2341,9 +2249,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         std::cout << "Coarse quantizer loaded\n";
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::init_query_buf(QueryBuffer &buf,
-                                                         size_t)
+    inline void IvfSsdIndex::init_query_buf(QueryBuffer &buf)
     {
         buf.rotated_query =
             memory::align_allocate<64, float, true>(padded_dim_ * sizeof(float));
@@ -2351,20 +2257,19 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             (ssd_store_ == SsdStore::Raw)
                 ? memory::align_allocate<64, float, true>(padded_dim_ * sizeof(float))
                 : nullptr;
-        buf.request_slot_bytes = page_num_per_io_ * SECTOR_LEN;
-        buf.sector_scratch = memory::align_allocate<SECTOR_LEN, char, true>(
-            N_REQ_BUF * buf.request_slot_bytes);
+        buf.read_bytes = read_bytes_;
+        buf.read_buffers = memory::align_allocate<SECTOR_LEN, char, true>(
+            kMaxReadsInFlight * buf.read_bytes);
         buf.est_distance.resize(fastscan::kBatchSize);
         buf.low_distance.resize(fastscan::kBatchSize);
         buf.ip_x0_qr.resize(fastscan::kBatchSize);
         buf.accu_arr.resize(fastscan::kBatchSize);
-        buf.init_page_candidate_storage(data_num_in_one_page_,
-                                        INITIAL_PAGE_SLOT_CAPACITY);
+        buf.init_page_candidate_storage(records_per_read_,
+                                        kInitialPageSlots);
         buf.reset();
     }
 
-    template <class PendingSet>
-    inline QueryBuffer *IVFSSD_Index<PendingSet>::pop_query_buf()
+    inline QueryBuffer *IvfSsdIndex::pop_query_buf()
     {
         QueryBuffer *data = thread_query_buffer_pool_.pop();
         while (data == thread_query_buffer_pool_.null_T)
@@ -2375,16 +2280,14 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         return data;
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::push_query_buf(QueryBuffer *buf)
+    inline void IvfSsdIndex::push_query_buf(QueryBuffer *buf)
     {
         thread_query_buffer_pool_.push(buf);
         thread_query_buffer_pool_.push_notify_all();
     }
 
-    template <class PendingSet>
-    inline PageCandidate_IO_Queue<PendingSet> *
-    IVFSSD_Index<PendingSet>::pop_ioqueue_buf()
+    inline PageReadQueue *
+    IvfSsdIndex::pop_ioqueue_buf()
     {
         auto *data = thread_ioqueue_buffer_pool_.pop();
         while (data == thread_ioqueue_buffer_pool_.null_T)
@@ -2395,33 +2298,30 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         return data;
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::push_ioqueue_buf(
-        PageCandidate_IO_Queue<PendingSet> *buf)
+    inline void IvfSsdIndex::push_ioqueue_buf(
+        PageReadQueue *buf)
     {
         thread_ioqueue_buffer_pool_.push(buf);
         thread_ioqueue_buffer_pool_.push_notify_all();
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::init_buffers(uint64_t nthreads,
-                                                       size_t topk)
+    inline void IvfSsdIndex::init_buffers(uint64_t nthreads)
     {
         const uint64_t n_buffers = nthreads;
         // Report the active per-thread queue depth once, on stderr. A
-        // requested depth above N_REQ_BUF is clamped; the clamp is reported
-        // explicitly rather than applied silently.
+        // requested depth above kMaxReadsInFlight is clamped; the clamp is
+        // reported explicitly rather than applied silently.
         {
-            const size_t qd_req = qd_per_thread_requested();
-            const size_t qd_cap = boundary_qd_per_thread();
+            const size_t qd_req = requested_qd_per_thread();
+            const size_t qd_cap = qd_per_thread();
             std::cerr << "[qd] per_thread_req=" << qd_req
                       << " nthreads=" << nthreads << " qd_cap=" << qd_cap
                       << " aggregate=" << qd_cap * nthreads;
             if (qd_req != qd_cap)
             {
-                std::cerr << "  [WARNING] requested qd=" << qd_req
-                          << " CLAMPED to N_REQ_BUF=" << N_REQ_BUF
-                          << " (raise IO_QUEUE_DEPTH to go deeper)";
+                std::cerr << "  [WARNING] RABITQ_QD_PER_THREAD=" << qd_req
+                          << " exceeds the per-thread limit of "
+                          << kMaxReadsInFlight << " reads; using the limit";
             }
             std::cerr << std::endl;
         }
@@ -2431,28 +2331,27 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         for (uint64_t i = 0; i < n_buffers; ++i)
         {
             auto *buf = new QueryBuffer();
-            init_query_buf(*buf, topk);
+            init_query_buf(*buf);
             thread_data_bufs_.push_back(buf);
             thread_query_buffer_pool_.push(buf);
 
-            auto *io_queue = new PageCandidate_IO_Queue<PendingSet>();
+            auto *io_queue = new PageReadQueue();
             thread_ioqueue_buffer_pool_.push(io_queue);
             thread_ioqueue_bufs_.push_back(io_queue);
         }
 
         LOG(INFO) << "Initialized " << n_buffers
-                  << " query buffers for IVFSSD_Index.";
+                  << " query buffers for IvfSsdIndex.";
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::destroy_buffers()
+    inline void IvfSsdIndex::destroy_buffers()
     {
         while (!thread_data_bufs_.empty())
         {
             QueryBuffer *buf = thread_data_bufs_.back();
             std::free(buf->rotated_query);
             std::free(buf->raw_query);
-            std::free(buf->sector_scratch);
+            std::free(buf->read_buffers);
             thread_data_bufs_.pop_back();
             delete buf;
         }
@@ -2464,57 +2363,54 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::init_cluster_scan_state(
+    inline void IvfSsdIndex::init_cluster_scan_state(
         const ivf::Cluster &cur_cluster, CID cid, ClusterScanState &state)
     {
         // Page-id tracking advances for every point in the cluster, regardless
         // of whether that point survives the mem-level prune. Only candidate
-        // insertion is conditional on low_distance <= distk.
+        // insertion is conditional on low_distance <= threshold.
         state.last_page = -1;
         state.cur_page_slot_id = kSlotMax;
         state.cur_inner_pid = -1;
-        state.cur_page = static_cast<PageIdx>(cluster_page_presums_[cid]);
+        state.cur_page = static_cast<PageIdx>(cluster_first_page_[cid]);
         state.in_page_idx = 0;
-        state.remaining_in_page = static_cast<int>(data_num_in_one_page_);
+        state.remaining_in_page = static_cast<int>(records_per_read_);
         state.mem_data = cur_cluster.batch_data();
         state.ids = cur_cluster.ids();
         state.scan_cand_inserted_local = 0;
         state.scan_pages_acq_local = 0;
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::scan_one_batch(
+    inline void IvfSsdIndex::scan_batch(
         const ivf::Cluster &cur_cluster,
         const SplitBatchQuery_nprobe<float> &q_obj, size_t probe_idx,
-        float distk, QueryBuffer *query_buf,
-        PageCandidate_IO_Queue<PendingSet> *io_queue, bool use_hacc,
-        SearchStats *stats, ClusterScanState &state, size_t iter)
+        float threshold, QueryBuffer *query_buf,
+        PageReadQueue *io_queue, bool use_hacc,
+        ClusterScanState &state, size_t iter)
     {
         const size_t n_iter =
             div_round_up(cur_cluster.num(), fastscan::kBatchSize);
 
-        const size_t batch_data_bytes = BatchDataMap<float>::data_bytes(mem_dim_);
-        const int data_num_in_one_page = static_cast<int>(data_num_in_one_page_);
-        const int page_num_per_io = static_cast<int>(page_num_per_io_);
+        const size_t batch_data_bytes = batch_bytes_;
+        const int records_per_read = static_cast<int>(records_per_read_);
+        const int pages_per_read = static_cast<int>(pages_per_read_);
 
         const size_t batch_size = std::min(
             fastscan::kBatchSize,
             cur_cluster.num() - iter * fastscan::kBatchSize);
 
-        mem_batch_binary_estdist(state.mem_data, q_obj, probe_idx,
-                                 query_buf->est_distance.data(),
-                                 query_buf->low_distance.data(),
-                                 query_buf->ip_x0_qr.data(), query_buf,
-                                 use_hacc);
+        estimate_batch(state.mem_data, q_obj, probe_idx,
+                       query_buf->est_distance.data(),
+                       query_buf->low_distance.data(),
+                       query_buf->ip_x0_qr.data(), query_buf, use_hacc);
 
         for (size_t idx = 0; idx < batch_size; ++idx)
         {
             ++state.cur_inner_pid;
             if (state.remaining_in_page == 0)
             {
-                state.cur_page += page_num_per_io;
-                state.remaining_in_page = data_num_in_one_page;
+                state.cur_page += pages_per_read;
+                state.remaining_in_page = records_per_read;
                 state.in_page_idx = 0;
             }
             const PageIdx cur_page_id = state.cur_page;
@@ -2522,7 +2418,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             --state.remaining_in_page;
             ++state.in_page_idx;
 
-            if (query_buf->low_distance[idx] > distk)
+            if (query_buf->low_distance[idx] > threshold)
             {
                 continue;
             }
@@ -2540,34 +2436,33 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             {
                 if (state.last_page != -1)
                 {
-                    push_pagecand_into_candidate_pool(
-                        query_buf, io_queue, state.cur_page_slot_id, stats);
+                    io_queue->enqueue_page(state.cur_page_slot_id);
                 }
                 state.last_page = cur_page_id;
                 state.cur_page_slot_id =
-                    io_queue->acquire_page_candidate_slot(query_buf);
+                    io_queue->acquire_page_slot();
                 ++state.scan_pages_acq_local;
 
-                PageCandidates &page_cand =
+                PageCandidate &page_cand =
                     query_buf->page_slots[state.cur_page_slot_id];
-                page_cand.probe_idx = static_cast<CID>(probe_idx);
+                page_cand.probe_idx = static_cast<uint32_t>(probe_idx);
                 page_cand.page_id = cur_page_id;
                 page_cand.candidate_num = 0;
                 page_cand.page_lower_bound = query_buf->low_distance[idx];
             }
 
-            PageCandidates &page_cand =
+            PageCandidate &page_cand =
                 query_buf->page_slots[state.cur_page_slot_id];
-            SingleCandidate *slot_candidates =
+            Candidate *slot_candidates =
                 query_buf->slot_candidates(state.cur_page_slot_id);
-            SingleCandidate &cand =
+            Candidate &cand =
                 slot_candidates[page_cand.candidate_num++];
             ++state.scan_cand_inserted_local;
-            cand.true_data_id = true_data_id;
+            cand.pid = true_data_id;
             cand.in_page_idx = cur_in_page_idx;
-            cand.mem_low_dist_ = query_buf->low_distance[idx];
-            cand.mem_est_dist_ = query_buf->est_distance[idx];
-            cand.mem_ip_x0_qr_ = query_buf->ip_x0_qr[idx];
+            cand.mem_low_dist = query_buf->low_distance[idx];
+            cand.mem_est_dist = query_buf->est_distance[idx];
+            cand.mem_ip_x0_qr = query_buf->ip_x0_qr[idx];
             page_cand.page_lower_bound = std::min(
                 page_cand.page_lower_bound, query_buf->low_distance[idx]);
         }
@@ -2579,15 +2474,13 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         state.mem_data += batch_data_bytes;
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::finalize_cluster_scan(
-        QueryBuffer *query_buf, PageCandidate_IO_Queue<PendingSet> *io_queue,
+    inline void IvfSsdIndex::finish_cluster(
+        PageReadQueue *io_queue,
         SearchStats *stats, ClusterScanState &state)
     {
         if (state.last_page != -1)
         {
-            push_pagecand_into_candidate_pool(query_buf, io_queue,
-                                              state.cur_page_slot_id, stats);
+            io_queue->enqueue_page(state.cur_page_slot_id);
         }
 
         if (stats != nullptr)
@@ -2597,8 +2490,68 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::query_one_boundary_qd(
+    inline void IvfSsdIndex::compute_probe_terms(
+        SplitBatchQuery_nprobe<float> &q_obj, size_t probe_idx, CID cid,
+        float dist, float qnorm, const QueryBuffer *query_buf)
+    {
+        if (metric_type_ == METRIC_L2)
+        {
+            q_obj.set_g_add(probe_idx, dist);
+        }
+        else if (metric_type_ == METRIC_IP)
+        {
+            // set_g_add(IP) expects g_error = ||q-c|| and g_add = -<q,c>
+            // (the negation happens inside set_g_add). How those two are
+            // obtained depends on the coarse quantizer.
+            float g_add_ip;
+            float g_error;
+            if (coarse_kind_ == CoarseKind::IRQ)
+            {
+                // IRQ coarse runs in normalized space, so `dist` is
+                // dist_IRQ = ||q_hat - c_hat||. Reconstruct from norms:
+                //   <q,c>   = (2 - dist_IRQ^2) * ||q|| * ||c|| / 2
+                //   ||q-c|| = sqrt(||q||^2 + ||c||^2 - 2<q,c>)
+                const auto *irq = static_cast<
+                    const ivf_irq::IvfRabitqInitializer *>(initer_);
+                const float cnorm = irq->centroid_norm(cid);
+                g_add_ip = 0.5F * (2.0F - dist * dist) * qnorm * cnorm;
+                g_error = std::sqrt(std::max(
+                    0.0F,
+                    (qnorm * qnorm) + (cnorm * cnorm) -
+                        (2.0F * g_add_ip)));
+            }
+            else
+            {
+                // Flat / HNSW coarse: `dist` is already the raw ||q-c||
+                // and the raw centroid is available, so take the exact
+                // dot product directly.
+                g_add_ip = dot_product<float>(query_buf->rotated_query,
+                                              initer_->centroid(cid),
+                                              padded_dim_);
+                g_error = dist;
+            }
+            q_obj.set_g_add(probe_idx, g_error, g_add_ip);
+        }
+        else
+        {
+            LOG(ERROR) << "Unsupported metric type";
+            crash();
+        }
+    }
+
+    inline void IvfSsdIndex::harvest_reads(
+        QueryBuffer *query_buf, PageReadQueue *io_queue,
+        const SplitBatchQuery_nprobe<float> &q_obj,
+        buffer::SearchBuffer<float> &knns, SearchStats *stats)
+    {
+        io_queue->poll_reads();
+        for (const SlotID slot_id : query_buf->completed_slots)
+        {
+            rerank_page(slot_id, query_buf, io_queue, q_obj, knns, stats);
+        }
+    }
+
+    inline void IvfSsdIndex::search_one(
         const float *query, size_t topk, size_t nprobe,
         PID *__restrict__ results, bool use_hacc,
         SearchStats *stats)
@@ -2610,13 +2563,13 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         QueryBuffer *query_buf = pop_query_buf();
         query_buf->reset();
         auto *io_queue = pop_ioqueue_buf();
-        io_queue->reset(query_buf);
 
-        // Per-thread in-flight cap (see boundary_qd_per_thread() in the
+        // Per-thread in-flight cap (see qd_per_thread() in the
         // header): identical for every thread, cached after the first call.
-        const size_t qd_cap = boundary_qd_per_thread();
+        const size_t qd_cap = qd_per_thread();
 
         void *ctx = file_reader_->get_ctx();
+        io_queue->reset(query_buf, file_reader_.get(), ctx, empty_ssd_, stats);
 
         rotator_->rotate(query, query_buf->rotated_query);
         if (ssd_store_ == SsdStore::Raw)
@@ -2670,57 +2623,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 stats->num_points_probed += cur_cluster.num();
             }
 
-            if (metric_type_ == METRIC_L2)
-            {
-                q_obj.set_g_add(i, dist);
-            }
-            else if (metric_type_ == METRIC_IP)
-            {
-                // set_g_add(IP) expects g_error = ||q-c|| and g_add = -<q,c>
-                // (the negation happens inside set_g_add). How those two are
-                // obtained depends on the coarse quantizer.
-                float g_add_ip;
-                float g_error;
-                if (coarse_kind_ == CoarseKind::IRQ)
-                {
-                    // IRQ coarse runs in normalized space, so `dist` is
-                    // dist_IRQ = ||q_hat - c_hat||. Reconstruct from norms:
-                    //   <q,c>   = (2 - dist_IRQ^2) * ||q|| * ||c|| / 2
-                    //   ||q-c|| = sqrt(||q||^2 + ||c||^2 - 2<q,c>)
-                    const auto *irq = static_cast<
-                        const ivf_irq::IvfRabitqInitializer *>(initer_);
-                    const float cnorm = irq->centroid_norm(cid);
-                    g_add_ip = 0.5F * (2.0F - dist * dist) * qnorm * cnorm;
-                    g_error = std::sqrt(std::max(
-                        0.0F,
-                        (qnorm * qnorm) + (cnorm * cnorm) -
-                            (2.0F * g_add_ip)));
-                }
-                else
-                {
-                    // Flat / HNSW coarse: `dist` is already the raw ||q-c||
-                    // and the raw centroid is available, so take the exact
-                    // dot product directly.
-                    g_add_ip = dot_product<float>(query_buf->rotated_query,
-                                                  initer_->centroid(cid),
-                                                  padded_dim_);
-                    g_error = dist;
-                }
-                q_obj.set_g_add(i, g_error, g_add_ip);
-            }
-            else
-            {
-                LOG(ERROR) << "Unsupported metric type";
-                crash();
-            }
-
-            // Cluster search runs at alpha=1.0 (unpruned, no extra
-            // pruning) for every probed cluster; only the drain phase prunes,
-            // via drain_alpha_. alpha_distk is still recomputed from the
-            // current knns at each alpha_quantile_dist call, so a re-rank
-            // within a cluster can still tighten this (alpha=1.0) threshold to
-            // the live topk-th distance.
-            const float cluster_alpha = 1.0F;
+            compute_probe_terms(q_obj, i, cid, dist, qnorm, query_buf);
 
             // For each 32-point batch refresh alpha_distk, scan just that
             // batch (Phase A), then immediately poll/re-rank (Phase B) +
@@ -2735,44 +2638,29 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
                 for (size_t iter = 0; iter < n_iter; ++iter)
                 {
-                    // Phase A (this batch): scan with the freshest
-                    // alpha_distk. cluster_alpha is fixed per cluster (per
-                    // probe_idx), but alpha_quantile_dist re-reads knns on
-                    // every call, so the per-batch threshold tracks the
-                    // current KNN buffer.
-                    const float distk =
-                        alpha_quantile_dist(knns, topk, cluster_alpha);
-                    scan_one_batch(cur_cluster, q_obj, i, distk, query_buf,
-                                   io_queue, use_hacc, stats, state, iter);
+                    // Each batch uses the current k-th distance for pruning.
+                    const float threshold =
+                        pruning_threshold(knns, topk, 1.0F);
+                    scan_batch(cur_cluster, q_obj, i, threshold, query_buf,
+                               io_queue, use_hacc, state, iter);
 
-                    int n_completed = 0;
-                    io_queue->poll_all_completed_out_of_order(
-                        file_reader_.get(), ctx, query_buf, n_completed,
-                        empty_ssd_);
-                    for (int j = 0; j < n_completed; ++j)
-                    {
-                        const SlotID slot_id = query_buf->completed_slots[j];
-                        complete_distance_for_page_candidate(
-                            slot_id, query_buf, io_queue, q_obj, knns, stats);
-                    }
-                    const size_t in_flight = io_queue->in_flight_size();
+                    harvest_reads(query_buf, io_queue, q_obj, knns, stats);
+                    const size_t in_flight = io_queue->inflight_count();
                     if (in_flight < qd_cap)
                     {
-                        io_queue->submit_top_io_pagecandidates(
-                            qd_cap - in_flight, query_buf, file_reader_.get(),
-                            ctx,
-                            alpha_quantile_dist(knns, topk, cluster_alpha),
-                            empty_ssd_, stats);
+                        io_queue->submit_reads(
+                            qd_cap - in_flight,
+                            pruning_threshold(knns, topk, 1.0F));
                     }
                 }
-                // finalize: push the last open page.
-                finalize_cluster_scan(query_buf, io_queue, stats, state);
+                // Enqueue the last open page.
+                finish_cluster(io_queue, stats, state);
             }
         }
 
         // Drain phase: poll/submit until in-flight = 0 AND pending is empty
         // (pending is drained either by submission or by alpha_distk-driven
-        // pruning inside submit_top_io_pagecandidates).
+        // pruning inside submit_reads).
         //
         // The wall time of this phase is the "exposed IO" signal: the main
         // loop above never blocks on IO (poll is a non-blocking peek), so any
@@ -2785,29 +2673,18 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         // Pending pages whose lower bound exceeds the drain_alpha-quantile
         // distance get dropped instead of read, cutting tail-end IOs that
         // would mostly miss the topk anyway. The rerank stage still uses
-        // the true distk = knns.top_dist() so genuinely good candidates
+        // the true threshold = knns.top_dist() so genuinely good candidates
         // whose IO already completed are never dropped after-the-fact.
         StopW drain_stopw;
-        while (!io_queue->empty())
+        while (!io_queue->reads_done())
         {
-            int n_completed = 0;
-            io_queue->poll_all_completed_out_of_order(
-                file_reader_.get(), ctx, query_buf, n_completed, empty_ssd_);
-            for (int j = 0; j < n_completed; ++j)
-            {
-                const SlotID slot_id = query_buf->completed_slots[j];
-                complete_distance_for_page_candidate(slot_id, query_buf,
-                                                     io_queue, q_obj, knns,
-                                                     stats);
-            }
-            const size_t in_flight = io_queue->in_flight_size();
+            harvest_reads(query_buf, io_queue, q_obj, knns, stats);
+            const size_t in_flight = io_queue->inflight_count();
             if (in_flight < qd_cap)
             {
-                io_queue->submit_top_io_pagecandidates(
-                    qd_cap - in_flight, query_buf,
-                    file_reader_.get(), ctx,
-                    alpha_quantile_dist(knns, topk, drain_alpha_),
-                    empty_ssd_, stats);
+                io_queue->submit_reads(
+                    qd_cap - in_flight,
+                    pruning_threshold(knns, topk, drain_alpha_));
             }
         }
 
@@ -2828,8 +2705,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         push_ioqueue_buf(io_queue);
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::batch_search(
+    inline void IvfSsdIndex::batch_search(
         const float *queries, size_t nqueries, size_t topk, size_t nprobe,
         PID *__restrict__ results, bool use_hacc, SearchStats *stats)
     {
@@ -2838,13 +2714,12 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 #pragma omp parallel for schedule(dynamic, 1)
         for (size_t i = 0; i < nqueries; ++i)
         {
-            query_one_boundary_qd(queries + i * dim_, topk, nprobe,
-                                  results + i * topk, use_hacc,
-                                  stats ? &stats[i] : nullptr);
+            search_one(queries + i * dim_, topk, nprobe,
+                       results + i * topk, use_hacc,
+                       stats ? &stats[i] : nullptr);
         }
     }
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::mem_batch_binary_estdist(
+    inline void IvfSsdIndex::estimate_batch(
         const char *mem_batch_data, const SplitBatchQuery_nprobe<float> &q_obj,
         const size_t probe_idx, float *est_distance, float *low_distance,
         float *ip_x0_qr, QueryBuffer *query_buf, bool use_hacc)
@@ -2914,21 +2789,9 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         low_dist_arr = est_dist_arr - f_error_arr * q_obj.g_error(probe_idx);
     }
 
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::push_pagecand_into_candidate_pool(
-        QueryBuffer *query_buf, PageCandidate_IO_Queue<PendingSet> *io_queue,
-        SlotID slot_id, SearchStats *stats)
-    {
-        PageCandidates &page_cand = query_buf->page_slots[slot_id];
-        io_queue->push_into_submit_candidate_pool(slot_id,
-                                                  page_cand.page_lower_bound,
-                                                  stats);
-    }
-
-    template <class PendingSet>
-    inline void IVFSSD_Index<PendingSet>::complete_distance_for_page_candidate(
+    inline void IvfSsdIndex::rerank_page(
         SlotID slot_id, QueryBuffer *query_buf,
-        PageCandidate_IO_Queue<PendingSet> *io_queue,
+        PageReadQueue *io_queue,
         const SplitBatchQuery_nprobe<float> &q_obj,
         buffer::SearchBuffer<float> &knns, SearchStats *stats)
     {
@@ -2941,19 +2804,19 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         {
             ++stats->main_pages_reranked;
         }
-        PageCandidates &page_cand = query_buf->page_slots[slot_id];
-        const char *data = io_queue->completed_data(query_buf, slot_id);
+        PageCandidate &page_cand = query_buf->page_slots[slot_id];
+        const char *data = io_queue->read_data(slot_id);
 
         uint64_t boost_dists = 0;  // # split_distance_boosting calls (real rerank compute)
         uint64_t knn_inserts = 0;  // # knns.insert calls
 
-        // The re-rank stage uses the true distk = knns.top_dist(), never
+        // The re-rank stage uses the true threshold = knns.top_dist(), never
         // alpha_distk. The IO for this page has already completed, so pruning
         // here with the tighter alpha_distk would save no work and could drop
         // a genuine topk result after its distance had been computed.
         // alpha_distk only throttles candidate generation (scan) and IO
         // submission upstream.
-        float distk = knns.top_dist();
+        float threshold = knns.top_dist();
 
         if (ssd_store_ == SsdStore::Raw)
         {
@@ -2966,16 +2829,16 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             const float *rq = query_buf->raw_query;
             const bool l2 = (metric_type_ == METRIC_L2);
             const bool u8 = (raw_elem_ == VecElemType::U8);
-            const SingleCandidate *slot_candidates =
+            const Candidate *slot_candidates =
                 query_buf->slot_candidates(slot_id);
             for (size_t cidx = 0; cidx < page_cand.candidate_num; ++cidx)
             {
-                const SingleCandidate &cand = slot_candidates[cidx];
-                if (cand.mem_low_dist_ > distk)
+                const Candidate &cand = slot_candidates[cidx];
+                if (cand.mem_low_dist > threshold)
                 {
                     continue;
                 }
-                const char *rec = data + cand.in_page_idx * one_data_ssd_bytes_;
+                const char *rec = data + cand.in_page_idx * record_bytes_;
                 float full_dist = 0.0F;
                 if (u8)
                 {
@@ -2991,36 +2854,36 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 }
                 ++boost_dists;
 
-                if (full_dist > distk)
+                if (full_dist > threshold)
                 {
                     continue;
                 }
-                knns.insert(cand.true_data_id, full_dist);
+                knns.insert(cand.pid, full_dist);
                 ++knn_inserts;
-                distk = knns.top_dist();
+                threshold = knns.top_dist();
             }
         }
         else if (ex_bits_ == 0 && ssd_dim_ == 0)
         {
-            const SingleCandidate *slot_candidates =
+            const Candidate *slot_candidates =
                 query_buf->slot_candidates(slot_id);
             for (size_t cidx = 0; cidx < page_cand.candidate_num; ++cidx)
             {
-                const SingleCandidate &cand = slot_candidates[cidx];
-                if (cand.mem_low_dist_ > distk)
+                const Candidate &cand = slot_candidates[cidx];
+                if (cand.mem_low_dist > threshold)
                 {
                     continue;
                 }
-                const float est_dist = cand.mem_est_dist_;
-                if (est_dist > distk)
+                const float est_dist = cand.mem_est_dist;
+                if (est_dist > threshold)
                 {
                     continue;
                 }
-                knns.insert(cand.true_data_id, est_dist);
+                knns.insert(cand.pid, est_dist);
                 ++knn_inserts;
-                distk = knns.top_dist();
+                threshold = knns.top_dist();
             }
-            // No boosting on this path: mem_est_dist_ is used directly.
+            // No boosting on this path: mem_est_dist is used directly.
         }
         else if (ex_bits_ == 0)
         {
@@ -3030,22 +2893,22 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         else
         {
             const size_t probe_idx = static_cast<size_t>(page_cand.probe_idx);
-            const SingleCandidate *slot_candidates =
+            const Candidate *slot_candidates =
                 query_buf->slot_candidates(slot_id);
             for (size_t cidx = 0; cidx < page_cand.candidate_num; ++cidx)
             {
-                const SingleCandidate &cand = slot_candidates[cidx];
-                if (cand.mem_low_dist_ > distk)
+                const Candidate &cand = slot_candidates[cidx];
+                if (cand.mem_low_dist > threshold)
                 {
                     continue;
                 }
 
-                const char *data_ptr = data + cand.in_page_idx * one_data_ssd_bytes_;
+                const char *data_ptr = data + cand.in_page_idx * record_bytes_;
                 const uint64_t *ssd_bin_ptr =
                     reinterpret_cast<const uint64_t *>(data_ptr);
                 const float ssd_ip_x0_qr = mask_ip_x0_q(
                     q_obj.rotated_query() + mem_dim_, ssd_bin_ptr, ssd_dim_);
-                const float ip_x0_qr = cand.mem_ip_x0_qr_ + ssd_ip_x0_qr;
+                const float ip_x0_qr = cand.mem_ip_x0_qr + ssd_ip_x0_qr;
 
                 const char *ex_data_ptr = data_ptr + (ssd_dim_ / 8);
                 const float full_dist = split_distance_boosting(
@@ -3053,13 +2916,13 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                     ex_bits_, ip_x0_qr);
                 ++boost_dists;
 
-                if (full_dist > distk)
+                if (full_dist > threshold)
                 {
                     continue;
                 }
-                knns.insert(cand.true_data_id, full_dist);
+                knns.insert(cand.pid, full_dist);
                 ++knn_inserts;
-                distk = knns.top_dist();
+                threshold = knns.top_dist();
             }
         }
 
@@ -3072,6 +2935,6 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             stats->main_knn_inserts += knn_inserts;
         }
 
-        io_queue->release_completed_slot(query_buf, slot_id);
+        io_queue->release_read(slot_id);
     }
-} // namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+} // namespace rabitqlib::ivf_ssd

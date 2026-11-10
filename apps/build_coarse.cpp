@@ -16,10 +16,10 @@
 
 #include "rabitqlib/defines.hpp"
 #include "rabitqlib/utils/stopw.hpp"
-#include "rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms.hpp"
+#include "rabitqlib/index/ivf/ivf_ssd.hpp"
 
-using index_type = rabitqlib::ivf_ssd_boundary_qd_ms::IVFSSD_Index;
-using CoarseKind = rabitqlib::ivf_ssd_boundary_qd_ms::CoarseKind;
+using index_type = rabitqlib::ivf_ssd::IvfSsdIndex;
+using CoarseKind = rabitqlib::ivf_ssd::CoarseKind;
 
 static std::string to_lower(std::string s)
 {

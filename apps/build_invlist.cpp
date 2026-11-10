@@ -19,12 +19,12 @@
 #include "rabitqlib/utils/stopw.hpp"
 #include "rabitqlib/utils/streaming_reader.hpp"
 #include "rabitqlib/utils/tools.hpp"
-#include "rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms.hpp"
+#include "rabitqlib/index/ivf/ivf_ssd.hpp"
 
 using PID = rabitqlib::PID;
 using CID = rabitqlib::CID;
-using index_type = rabitqlib::ivf_ssd_boundary_qd_ms::IVFSSD_Index;
-using SsdStore = rabitqlib::ivf_ssd_boundary_qd_ms::SsdStore;
+using index_type = rabitqlib::ivf_ssd::IvfSsdIndex;
+using SsdStore = rabitqlib::ivf_ssd::SsdStore;
 using data_type = rabitqlib::RowMajorArray<float>;
 using cid_type = rabitqlib::RowMajorArray<CID>;
 
@@ -387,10 +387,8 @@ int main(int argc, char **argv)
     std::cout << "\tK: " << k << '\n';
 
     rabitqlib::StopW stopw;
-    // The coarse-quantizer ctor args are left at their defaults: build_invlist
-    // builds no coarse quantizer, so coarse_kind / initializer_type are unused.
     // A raw store has no extra-precision code, so total_bits does not apply;
-    // 1 keeps the constructor's range check satisfied whatever was passed.
+    // 1 satisfies the constructor's range check.
     index_type ivf_ssd_index(num_points, dim, k,
                              (ssd_store == SsdStore::Raw) ? 1 : total_bits,
                              ssd_index_file, metric_type,

@@ -37,7 +37,7 @@
 #include "rabitqlib/utils/rotator.hpp"
 #include "rabitqlib/utils/space.hpp"
 
-namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+namespace rabitqlib::ivf_ssd
 {
     // Selects the coarse quantizer / initializer the index uses.
     //   Flat / HNSW -> built through the ivf::Initializer factory.
@@ -69,25 +69,24 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
     // Cluster scan is batched: for each 32-point batch the scan refreshes
     // alpha_distk, scans the batch, then immediately polls/re-ranks/submits.
-    // alpha_distk (see alpha_quantile_dist) is the threshold used both for
+    // alpha_distk (see pruning_threshold) is the threshold used both for
     // mem-level pruning and for pending-page pruning.
 
     // Alpha control (drain-only).
     //
     // During the cluster-search loop (probe_idx in [0, nprobe)) alpha is fixed
-    // at 1.0 -- the plain distk, i.e. NO extra pruning -- so every probed
+    // at 1.0 -- the plain threshold, i.e. NO extra pruning -- so every probed
     // cluster contributes its full candidate set. Only the DRAIN phase
     // (probe_idx >= nprobe), where the remaining pending pages are far from the
     // query and unlikely to hold genuine topk, prunes: it uses a single
     // user-specified drain_alpha (set_drain_alpha). drain_alpha == 1.0 disables
-    // drain pruning as well (plain distk everywhere); a smaller drain_alpha
+    // drain pruning as well (plain threshold everywhere); a smaller drain_alpha
     // prunes the drain tail harder. The drain threshold is
-    // alpha_quantile_dist(knns, topk, drain_alpha), recomputed from the current
+    // pruning_threshold(knns, topk, drain_alpha), recomputed from the current
     // KNN buffer at each drain submit.
 
-    constexpr size_t N_REQ_BUF = MAX_EVENTS;
-    constexpr size_t INITIAL_PAGE_SLOT_CAPACITY = N_REQ_BUF + 1;
-    constexpr size_t DEFAULT_EMPTY_SSD_GROUP_SIZE = 8;
+    constexpr size_t kInitialPageSlots = kMaxReadsInFlight + 1;
+    constexpr size_t kEmptySsdGroupSize = 8;
 
     // ---------------------------------------------------------------------
     // Split-storage on-disk format.
@@ -139,7 +138,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         return h;
     }
 
-    // Per-thread cap on in-flight SSD reads. Every thread runs with exactly
+    // Per-thread cap on in-flight SSD reads. Every thread runs with at most
     // this many outstanding reads, independent of the thread count, so thread
     // count and queue depth are independent knobs: the aggregate in-flight
     // depth is qd * nthreads.
@@ -147,11 +146,11 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     // Overridable at run time through the RABITQ_QD_PER_THREAD environment
     // variable (parsed once, then cached); when unset the compiled default
     // below applies. The best depth is device- and thread-count-specific.
-    constexpr size_t QD_PER_THREAD_DEFAULT = 16;
+    constexpr size_t kDefaultQdPerThread = 16;
 
     // The requested depth, UNCLAMPED. init_buffers compares it against the
     // effective cap below and reports when a request has been clamped.
-    inline size_t qd_per_thread_requested()
+    inline size_t requested_qd_per_thread()
     {
         static const size_t v = []() -> size_t {
             if (const char *e = std::getenv("RABITQ_QD_PER_THREAD"))
@@ -159,7 +158,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                 const long parsed = std::atol(e);
                 if (parsed > 0) { return static_cast<size_t>(parsed); }
             }
-            return QD_PER_THREAD_DEFAULT;
+            return kDefaultQdPerThread;
         }();
         return v;
     }
@@ -167,16 +166,16 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     // The effective per-thread in-flight cap: the request clamped to the
     // per-thread request-slot / registered-buffer count (a deeper queue would
     // have nowhere to put its reads).
-    inline size_t boundary_qd_per_thread()
+    inline size_t qd_per_thread()
     {
-        const size_t qd = qd_per_thread_requested();
-        return (qd > N_REQ_BUF) ? N_REQ_BUF : qd;
+        const size_t qd = requested_qd_per_thread();
+        return (qd > kMaxReadsInFlight) ? kMaxReadsInFlight : qd;
     }
 
     // ---------------------------------------------------------------------
     // The pruning threshold (alpha_distk).
     //
-    // The plain threshold is distk = knns.top_dist(), the distance of the
+    // The plain threshold is knns.top_dist(), the distance of the
     // topk-th (worst) neighbour currently held; it decides (a) which scanned
     // points become page candidates and (b) which pending pages survive
     // submit-time pruning. With a small memdim the mem-level lower bound is
@@ -189,22 +188,22 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     // are produced (trading a little recall for latency). The KNN buffer still
     // holds the true topk and the final results are still the true topk;
     // alpha_distk is only a derived pruning threshold. The re-rank stage
-    // (complete_distance_for_page_candidate) deliberately keeps using the
-    // true top_dist(), so no genuine topk result is dropped once its
-    // distance has been computed.
+    // (rerank_page) deliberately keeps using the true top_dist(), so no genuine
+    // topk result is dropped once its distance has been computed.
     //
     // WHERE ALPHA IS APPLIED: the cluster-search loop always calls this with
-    // alpha=1.0 (so it returns top_dist() = the plain distk, no extra pruning).
-    // Only the DRAIN phase calls it with the user's drain_alpha_ (< 1), pruning
-    // pending pages whose lower bound exceeds the drain_alpha-quantile distance
-    // -- cutting tail-end SSD IOs / reranks that would mostly miss the topk.
+    // alpha=1.0 (so it returns top_dist() = the plain threshold, no extra
+    // pruning). Only the DRAIN phase calls it with the user's drain_alpha_
+    // (< 1), pruning pending pages whose lower bound exceeds the
+    // drain_alpha-quantile distance -- cutting tail-end SSD IOs / reranks that
+    // would mostly miss the topk.
     // See the "Alpha control (drain-only)" note above.
     //
     // Until the KNN buffer is full the alpha-quantile element does not exist,
     // so this returns top_dist() (== +inf pre-full) and no pruning occurs.
-    // alpha >= 1 likewise degenerates to the plain distk.
-    inline float alpha_quantile_dist(buffer::SearchBuffer<float> &knns,
-                                     size_t topk, float alpha)
+    // alpha >= 1 likewise degenerates to the plain threshold.
+    inline float pruning_threshold(const buffer::SearchBuffer<float> &knns,
+                                   size_t topk, float alpha)
     {
         if (alpha >= 1.0F || !knns.is_full())
         {
@@ -227,27 +226,26 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
     struct SearchStats
     {
-        // Total wall time of query_one_boundary_qd for this query (us).
+        // Total wall time of search_one for this query (us).
         double total_us = 0.0;
         // SSD read accounting, all counted at the single submit site:
         //   issued_read_reqs  : # read REQUESTS submitted
-        //   issued_read_pages : pages covered (req.len / SECTOR_LEN)
+        //   issued_read_pages : 4 KiB pages covered (req.len / SECTOR_LEN)
         //   issued_read_bytes : bytes requested (exact)
-        // pages != reqs when one request spans multiple contiguous pages.
+        // pages != requests when one request spans multiple contiguous pages.
         uint64_t issued_read_reqs = 0;
         uint64_t issued_read_pages = 0;
         uint64_t issued_read_bytes = 0;
         uint64_t num_points_probed = 0;
         // Scan-phase bookkeeping-analysis counters (per query):
         //   scan_candidates_inserted : points that passed the mem-prune and
-        //                              got a SingleCandidate written.
+        //                              got a Candidate written.
         //   scan_pages_acquired      : page-candidate slots acquired in scan.
         //   peak_page_slots          : page_slots pool high-water mark.
         //
         // Main-pipeline rerank funnel (one completed page IO expands into many
         // record evaluations, only some of which pay the boost kernel):
-        //   main_pages_reranked      : # calls to
-        //                              complete_distance_for_page_candidate,
+        //   main_pages_reranked      : # calls to rerank_page,
         //                              i.e. # SSD page-IOs that completed and
         //                              were handed to the main-pipeline rerank
         //                              stage. A per-PAGE count (drained pages
@@ -258,15 +256,16 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         //                              iterated over.
         //   main_boost_dists         : # actual split_distance_boosting calls
         //                              = records that survived the cheap
-        //                              mem_low_dist_ vs distk early-exit. THIS
-        //                              is the real rerank compute (each costs
-        //                              2*ex_bits*padded_dim + 6 flop-eq).
+        //                              mem_low_dist vs threshold early-exit.
+        //                              THIS is the real rerank compute (each
+        //                              costs 2*ex_bits*padded_dim + 6 flop-eq).
         //                              0 on the ex_bits_==0 && ssd_dim_==0 path
-        //                              (no boosting: mem_est_dist_ used
+        //                              (no boosting: mem_est_dist used
         //                              directly). With the Raw store it counts
         //                              exact distance evaluations instead.
         //   main_knn_inserts         : # knns.insert calls (records that also
-        //                              passed the final full_dist <= distk).
+        //                              passed the final
+        //                              full_dist <= threshold).
         // Useful ratios: boost_dists/records_examined = mem lower-bound prune
         // pass rate; boost_dists/pages_reranked = boosts per page IO.
         uint64_t scan_candidates_inserted = 0;
@@ -325,29 +324,29 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         }
     };
 
-    // Global page index into <base>.ssd. int covers 2^31 - 1 pages (8 TiB),
-    // and check_ssd_pages refuses a larger layout at build and load; the
-    // 64-bit point-id build, meant for larger indexes, widens it.
+    // Global 4 KiB page index into <base>.ssd. int covers 2^31 - 1 pages
+    // (8 TiB), and check_ssd_pages refuses a larger layout at build and load;
+    // the 64-bit point-id build, meant for larger indexes, widens it.
 #if defined(RABITQ_PID64)
     using PageIdx = int64_t;
 #else
     using PageIdx = int;
 #endif
 
-    struct SingleCandidate
+    struct Candidate
     {
-        PID true_data_id;
+        PID pid;
         int in_page_idx;
-        float mem_low_dist_;
-        float mem_est_dist_;
-        float mem_ip_x0_qr_;
+        float mem_low_dist;
+        float mem_est_dist;
+        float mem_ip_x0_qr;
     };
 
-    struct PageCandidates
+    struct PageCandidate
     {
         float page_lower_bound = 0.0F;
-        CID probe_idx = static_cast<CID>(-1);
-        PageIdx page_id = -1;
+        uint32_t probe_idx = static_cast<uint32_t>(-1);
+        PageIdx page_id = -1; // Global 4 KiB page index.
         int req_slot = -1;
 
         uint16_t candidate_num = 0;
@@ -361,22 +360,22 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         // the unrotated query; the rotation is orthonormal, so the in-memory
         // bounds computed in rotated space still bound these distances.
         float *raw_query = nullptr;
-        char *sector_scratch = nullptr;
+        char *read_buffers = nullptr;
 
         std::vector<float> est_distance;
         std::vector<float> low_distance;
         std::vector<float> ip_x0_qr;
         std::vector<int32_t> accu_arr;
-        uint64_t request_slot_bytes = 0;
+        uint64_t read_bytes = 0;
         uint16_t page_candidate_capacity = 0;
         std::vector<AnnCandidate<float>> centroid_dist;
 
-        std::array<IORequest, N_REQ_BUF> reqs{};
-        std::array<SlotID, N_REQ_BUF> req_slot_owner{};
+        std::array<IORequest, kMaxReadsInFlight> requests{};
+        std::array<SlotID, kMaxReadsInFlight> req_slot_owner{};
         std::vector<SlotID> completed_slots;
 
-        std::vector<PageCandidates> page_slots;
-        std::vector<SingleCandidate> candidate_storage;
+        std::vector<PageCandidate> page_slots;
+        std::vector<Candidate> candidate_storage;
         std::vector<SlotID> free_page_slots;
         std::vector<int> free_req_slots;
 
@@ -384,12 +383,12 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                                          size_t initial_slots);
         void ensure_page_slot_capacity(size_t target_slots);
         void reset();
-        [[nodiscard]] char *request_buffer(int req_slot) const;
-        [[nodiscard]] SingleCandidate *slot_candidates(SlotID slot_id);
-        [[nodiscard]] const SingleCandidate *slot_candidates(SlotID slot_id) const;
+        [[nodiscard]] char *read_buffer(int req_slot) const;
+        [[nodiscard]] Candidate *slot_candidates(SlotID slot_id);
+        [[nodiscard]] const Candidate *slot_candidates(SlotID slot_id) const;
     };
 
-    class ArrayPendingSet
+    class PendingPages
     {
     public:
         struct Entry
@@ -399,13 +398,12 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         };
 
         void reset();
-        void on_slot_grow(size_t new_slot_count);
         [[nodiscard]] bool empty() const;
         [[nodiscard]] size_t size() const;
         void insert(SlotID slot_id, float key);
         [[nodiscard]] SlotID front_slot() const;
         void pop_front();
-        void prune_greater(float distk, std::vector<SlotID> &pruned_slots);
+        void prune_greater(float threshold, std::vector<SlotID> &pruned_slots);
 
     private:
         void compact_if_needed();
@@ -415,37 +413,27 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
     };
 
 
-    template <class PendingSet>
-    class PageCandidate_IO_Queue
+    class PageReadQueue
     {
     public:
-        void reset(QueryBuffer *query_buf);
-        [[nodiscard]] size_t in_flight_size() const { return inflight_count_; }
-        [[nodiscard]] bool empty() const
+        // Bind the query's buffer, reader, IO context, empty-SSD flag and stats until the next reset().
+        void reset(QueryBuffer *query_buf, LinuxAlignedFileReader *file_reader,
+                   void *ctx, bool empty_ssd, SearchStats *stats);
+        [[nodiscard]] size_t inflight_count() const { return inflight_count_; }
+        [[nodiscard]] bool reads_done() const
         {
             return pending_.empty() && inflight_count_ == 0 && ready_completed_.empty();
         }
-        SlotID acquire_page_candidate_slot(QueryBuffer *query_buf);
+        SlotID acquire_page_slot();
 
-        int push_into_submit_candidate_pool(SlotID slot_id, float page_lower_bound,
-                                            SearchStats *stats = nullptr);
+        void enqueue_page(SlotID slot_id);
 
-        int submit_top_io_pagecandidates(size_t max_n_page_submit,
-                                         QueryBuffer *query_buf,
-                                         LinuxAlignedFileReader *file_reader,
-                                         void *ctx, float distk,
-                                         bool empty_ssd = false,
-                                         SearchStats *stats = nullptr);
+        int submit_reads(size_t budget, float threshold);
 
-        void poll_all_completed_out_of_order(
-            LinuxAlignedFileReader *file_reader, void *ctx,
-            QueryBuffer *query_buf, int &n_completed,
-            bool empty_ssd = false,
-            SearchStats *stats = nullptr);
+        void poll_reads();
 
-        [[nodiscard]] const char *completed_data(const QueryBuffer *query_buf,
-                                                 SlotID slot_id) const;
-        void release_completed_slot(QueryBuffer *query_buf, SlotID slot_id);
+        [[nodiscard]] const char *read_data(SlotID slot_id) const;
+        void release_read(SlotID slot_id);
 
     private:
         static constexpr int kInvalidReqSlot = -1;
@@ -456,27 +444,24 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         static constexpr uint8_t kStateCompleted = 4;
 
         void ensure_slot_capacity(size_t target_slots);
-        void release_page_slot(QueryBuffer *query_buf, SlotID slot_id);
-        void prune_pending_above(QueryBuffer *query_buf, float distk);
-        void prepare_request(QueryBuffer *query_buf, SlotID slot_id, int req_slot);
+        void release_page_slot(SlotID slot_id);
+        void prune_pending_above(float threshold);
+        void prepare_read(SlotID slot_id, int req_slot);
 
-        template <bool LimitByCandidateCount>
-        int submit_impl(size_t budget,
-                        QueryBuffer *query_buf,
-                        LinuxAlignedFileReader *file_reader,
-                        void *ctx, float distk,
-                        bool empty_ssd,
-                        SearchStats *stats);
-
-        PendingSet pending_;
+        QueryBuffer *query_buf_ = nullptr;
+        LinuxAlignedFileReader *file_reader_ = nullptr;
+        void *ctx_ = nullptr;
+        bool empty_ssd_ = false;
+        SearchStats *stats_ = nullptr;
+        PendingPages pending_;
         std::vector<uint8_t> slot_state_;
         std::vector<int> slot_req_slot_;
         std::vector<SlotID> ready_completed_;
+        std::vector<SlotID> pruned_slots_;
         size_t inflight_count_ = 0;
     };
 
-    template <class PendingSet>
-    class IVFSSD_Index
+    class IvfSsdIndex
     {
     private:
         ivf::Initializer *initer_ = nullptr;
@@ -494,7 +479,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         // meaningful for Flat / HNSW (fed to ivf::create_initializer).
         CoarseKind coarse_kind_ = CoarseKind::Flat;
         ivf::InitializerType initializer_type_ = ivf::InitializerType::Auto;
-        // IRQ-only inputs, captured at construction and consumed inside
+        // IRQ-only inputs, set by build_coarse_quantizer and consumed inside
         // ivf_irq::IvfRabitqInitializer. Unused for Flat / HNSW.
         std::string inner_centroids_path_;
         std::string inner_cids_path_;
@@ -520,8 +505,8 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
         // Drain-phase alpha (see the "Alpha control (drain-only)" note above).
         // Cluster search always runs at alpha=1.0; only the drain phase prunes,
-        // using this single value. Default 1.0 = no drain pruning (plain distk
-        // everywhere); set < 1.0 to prune the drain tail harder.
+        // using this single value. Default 1.0 = no drain pruning (plain
+        // threshold everywhere); set < 1.0 to prune the drain tail harder.
         float drain_alpha_ = 1.0F;
 
         [[nodiscard]] size_t ids_bytes() const { return sizeof(PID) * num_; }
@@ -533,7 +518,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             {
                 total_blocks += div_round_up(cluster_sizes[i], fastscan::kBatchSize);
             }
-            return total_blocks * BatchDataMap<float>::data_bytes(mem_dim_);
+            return total_blocks * batch_bytes_;
         }
 
         // Split-storage build steps. allocate_invlist_memory allocates the
@@ -557,11 +542,14 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         std::string ssd_index_file_;
 
         size_t ssd_dim_ = 0;
-        size_t one_data_ssd_bytes_ = 0;
-        size_t data_num_in_one_page_ = 0;
-        size_t page_num_per_io_ = 0;
+        size_t record_bytes_ = 0;
+        size_t records_per_read_ = 0;
+        size_t pages_per_read_ = 0;
+        size_t read_bytes_ = 0;
+        size_t batch_bytes_ = 0;
 
-        std::vector<size_t> cluster_page_presums_;
+        // First 4 KiB page of each cluster in <base>.ssd.
+        std::vector<size_t> cluster_first_page_;
 
         void init_layout_metadata();
         // One log line with the SSD store and the page layout it implies.
@@ -576,7 +564,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         // Gives <base>.ssd its full size before the build writes it, unless
         // its file system lacks room for it plus reserve_bytes.
         void preallocate_ssd_file(uint64_t reserve_bytes);
-        // Exits when the clusters need more SSD pages than PageIdx can
+        // Exits when the clusters need more 4 KiB SSD pages than PageIdx can
         // address (2^31 - 1 in the default build), naming the 64-bit build.
         void check_ssd_pages(const std::vector<size_t> &cluster_sizes) const;
         // Exits when the SSD records would hold only the 1-bit code beyond
@@ -624,20 +612,20 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
         ConcurrentQueue<QueryBuffer *> thread_query_buffer_pool_;
         std::vector<QueryBuffer *> thread_data_bufs_;
-        ConcurrentQueue<PageCandidate_IO_Queue<PendingSet> *> thread_ioqueue_buffer_pool_;
-        std::vector<PageCandidate_IO_Queue<PendingSet> *> thread_ioqueue_bufs_;
+        ConcurrentQueue<PageReadQueue *> thread_ioqueue_buffer_pool_;
+        std::vector<PageReadQueue *> thread_ioqueue_bufs_;
 
-        void init_query_buf(QueryBuffer &buf, size_t topk = 100);
+        void init_query_buf(QueryBuffer &buf);
         QueryBuffer *pop_query_buf();
         void push_query_buf(QueryBuffer *buf);
-        PageCandidate_IO_Queue<PendingSet> *pop_ioqueue_buf();
-        void push_ioqueue_buf(PageCandidate_IO_Queue<PendingSet> *buf);
+        PageReadQueue *pop_ioqueue_buf();
+        void push_ioqueue_buf(PageReadQueue *buf);
 
         // Per-cluster scan state shared across batches of a single cluster.
         // Holds the page-tracking cursor (a page may span several 32-point
         // batches and stays "open" here until it closes) plus the per-cluster
         // stat accumulators. It has to outlive a single batch because the
-        // search interleaves poll / re-rank / submit between scan_one_batch
+        // search interleaves poll / re-rank / submit between scan_batch
         // calls, and the open page must survive that.
         struct ClusterScanState
         {
@@ -651,7 +639,7 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             char *mem_data = nullptr;
             const PID *ids = nullptr;
             // Per-cluster stat accumulators, flushed into SearchStats by
-            // finalize_cluster_scan.
+            // finish_cluster.
             size_t scan_cand_inserted_local = 0;
             size_t scan_pages_acq_local = 0;
         };
@@ -662,48 +650,43 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
 
         // Scan one 32-point batch (index `iter`) of the current cluster.
         // Page-tracking state in `state` carries over between batches; a page
-        // that spans batches stays open and is only pushed when it closes.
-        void scan_one_batch(
+        // that spans batches stays open and is only enqueued when it closes.
+        void scan_batch(
             const ivf::Cluster &cur_cluster,
             const SplitBatchQuery_nprobe<float> &q_obj,
             size_t probe_idx,
-            float distk,
+            float threshold,
             QueryBuffer *query_buf,
-            PageCandidate_IO_Queue<PendingSet> *io_queue,
+            PageReadQueue *io_queue,
             bool use_hacc,
-            SearchStats *stats,
             ClusterScanState &state,
             size_t iter);
 
-        // Push the final open page (if any) and flush per-cluster stat
+        // Enqueue the final open page (if any) and flush per-cluster stat
         // accumulators into SearchStats.
-        void finalize_cluster_scan(
-            QueryBuffer *query_buf,
-            PageCandidate_IO_Queue<PendingSet> *io_queue,
+        void finish_cluster(
+            PageReadQueue *io_queue,
             SearchStats *stats,
             ClusterScanState &state);
 
         // Per-query worker used by batch_search.
-        // Boundary-QD recipe (single thread):
+        // Search steps for one query:
         //   for each of nprobe clusters in centroid-distance order:
         //     A. scan the cluster (populates io_queue.pending), pruning
         //        mem-level points whose lower bound exceeds alpha_distk
         //     B. poll any completed IOs and re-rank them (re-rank still uses
-        //        the true distk = knns.top_dist(), refreshing alpha_distk)
+        //        the true threshold = knns.top_dist(), refreshing alpha_distk)
         //     C. submit IOs from io_queue.pending up to qd_cap in-flight
-        //        (submit_top_io_pagecandidates internally prunes pending whose
-        //        page_lower_bound >= alpha_distk). qd_cap comes from
-        //        boundary_qd_per_thread().
+        //        (submit_reads internally prunes pending whose page_lower_bound
+        //        >= alpha_distk). qd_cap comes from qd_per_thread().
         //   drain: while io_queue is non-empty, repeat (poll, re-rank, submit)
         //          with the same qd_cap, until in-flight = 0 and pending is
         //          exhausted (either consumed or pruned).
-        void query_one_boundary_qd(const float *query, size_t topk,
-                                   size_t nprobe,
-                                   PID *__restrict__ results,
-                                   bool use_hacc,
-                                   SearchStats *stats);
+        void search_one(const float *query, size_t topk, size_t nprobe,
+                        PID *__restrict__ results, bool use_hacc,
+                        SearchStats *stats);
 
-        void mem_batch_binary_estdist(
+        void estimate_batch(
             const char *mem_batch_data,
             const SplitBatchQuery_nprobe<float> &q_obj,
             const size_t probe_idx,
@@ -713,18 +696,20 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             QueryBuffer *query_buf,
             bool use_hacc);
 
-        void complete_distance_for_page_candidate(
+        void rerank_page(
             SlotID slot_id, QueryBuffer *query_buf,
-            PageCandidate_IO_Queue<PendingSet> *io_queue,
+            PageReadQueue *io_queue,
             const SplitBatchQuery_nprobe<float> &q_obj,
             buffer::SearchBuffer<float> &knns,
             SearchStats *stats = nullptr);
 
-        void push_pagecand_into_candidate_pool(
-            QueryBuffer *query_buf,
-            PageCandidate_IO_Queue<PendingSet> *io_queue,
-            SlotID slot_id,
-            SearchStats *stats = nullptr);
+        void compute_probe_terms(
+            SplitBatchQuery_nprobe<float> &q_obj, size_t probe_idx, CID cid,
+            float dist, float qnorm, const QueryBuffer *query_buf);
+        void harvest_reads(
+            QueryBuffer *query_buf, PageReadQueue *io_queue,
+            const SplitBatchQuery_nprobe<float> &q_obj,
+            buffer::SearchBuffer<float> &knns, SearchStats *stats);
 
     public:
         enum class ClusterOrderMode : std::uint8_t
@@ -733,23 +718,23 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
             OrderedByCentroidDistance = 1,
         };
 
-        explicit IVFSSD_Index() = default;
-        // Unified ctor. coarse_kind selects the coarse quantizer; for
-        // Flat / HNSW (or Auto, resolved via initializer_type) the IRQ-only
-        // params are ignored. For CoarseKind::IRQ the caller must pass
-        // inner_centroids_path / inner_cids_path; initializer_type is then
-        // ignored.
-        explicit IVFSSD_Index(size_t num, size_t dim, size_t num_cluster,
-                              size_t total_bits, std::string ssd_index_file,
-                              MetricType metric_type = rabitqlib::METRIC_L2,
-                              RotatorType type = RotatorType::FhtKacRotator,
-                              size_t mem_dim = 0,
-                              CoarseKind coarse_kind = CoarseKind::Flat,
-                              ivf::InitializerType initializer_type =
-                                  ivf::InitializerType::Auto,
-                              std::string inner_centroids_path = std::string(),
-                              std::string inner_cids_path = std::string());
-        ~IVFSSD_Index();
+        explicit IvfSsdIndex() = default;
+        // num: number of indexed points, from 0 through the PID range.
+        // dim: positive input width supported by the selected rotator.
+        // num_cluster: positive number of clusters within the CID range.
+        // total_bits: quantization bits per dimension in [1, 9].
+        // ssd_index_file: SSD file path, opened for writing and created if
+        // missing.
+        // metric_type: METRIC_L2 or METRIC_IP, default METRIC_L2.
+        // type: MatrixRotator or FhtKacRotator, default FhtKacRotator.
+        // mem_dim: 0 for padded width, or a multiple of 64 in
+        // [64, padded width].
+        explicit IvfSsdIndex(size_t num, size_t dim, size_t num_cluster,
+                             size_t total_bits, std::string ssd_index_file,
+                             MetricType metric_type = rabitqlib::METRIC_L2,
+                             RotatorType type = RotatorType::FhtKacRotator,
+                             size_t mem_dim = 0);
+        ~IvfSsdIndex();
 
         [[nodiscard]] size_t num_clusters() const { return num_cluster_; }
         [[nodiscard]] size_t num_points() const { return num_; }
@@ -815,12 +800,13 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
         // coarse file pairs with this base.
         void load_coarse(const std::string &coarse_index_file);
 
-        void init_buffers(uint64_t nthreads, size_t topk = 100);
+        void init_buffers(uint64_t nthreads);
         void destroy_buffers();
 
         // Drain-phase alpha. Call once after load(), before batch_search.
-        // Clamped to [0,1]; 1.0 = no drain pruning (plain distk everywhere),
-        // smaller prunes the drain tail harder. Cluster search is always 1.0.
+        // Clamped to [0,1]; 1.0 = no drain pruning (plain threshold
+        // everywhere), smaller prunes the drain tail harder. Cluster search
+        // is always 1.0.
         void set_drain_alpha(float drain_alpha)
         {
             if (drain_alpha < 0.0F) drain_alpha = 0.0F;
@@ -856,6 +842,6 @@ namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
                           bool use_hacc = false,
                           SearchStats *stats = nullptr);
     };
-} // namespace rabitqlib::ivf_ssd_boundary_qd_ms_detail
+} // namespace rabitqlib::ivf_ssd
 
-#include "rabitqlib/index/ivf/ivf_ssd_boundary_qd_ms_common.tpp"
+#include "rabitqlib/index/ivf/ivf_ssd.tpp"
