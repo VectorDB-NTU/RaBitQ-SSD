@@ -1321,7 +1321,7 @@ namespace rabitqlib::ivf_ssd
                        << (r_res >> 20) << " MiB and SSD writer buffers reserve ~"
                        << (writer_reserve >> 20) << " MiB for " << T
                        << " threads, but 0.85*budget = " << (b_total >> 20)
-                       << " MiB. Lower MEMDIM or build threads, or raise mem_budget_gb.";
+                       << " MiB. Lower MEMDIM or OMP_NUM_THREADS, or raise mem_budget_gb.";
             std::exit(1);
         }
         const size_t b_trans = b_total - r_res - writer_reserve;
@@ -2582,8 +2582,9 @@ namespace rabitqlib::ivf_ssd
         }
         if (stats != nullptr)
         {
-            // Roofline buckets: each thread_local is written by the
-            // Initializer subtype (Flat/HNSW: only full_l2; IRQ: all three).
+            // Coarse-search work counters: the Initializer subtype writes all
+            // three thread_locals on every call with nprobe > 0 (Flat/HNSW:
+            // full_l2, the other two 0; IRQ: all three).
             stats->centroid_full_l2_dists += ivf::last_full_l2_dists;
             stats->centroid_fastscan_attempts += ivf::last_fastscan_attempts;
             stats->centroid_exbits_refines += ivf::last_exbits_refines;
@@ -2707,8 +2708,9 @@ namespace rabitqlib::ivf_ssd
 
         // An error in one search thread (for example a failed io_setup, or a
         // coarse quantizer that returns fewer than nprobe clusters) stops the
-        // remaining queries. The first error is rethrown here, once, after the
-        // parallel loop, instead of from every thread inside it.
+        // remaining queries. An exception must not leave an OpenMP parallel
+        // region, so the first error is kept and rethrown here, once, after
+        // the parallel loop.
         std::exception_ptr first_error;
         std::atomic<bool> stop{false};
 #pragma omp parallel for schedule(dynamic, 1)

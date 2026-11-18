@@ -1,3 +1,9 @@
+// Modified for RaBitQ-SSD from hnswlib as vendored in RaBitQ-Library
+// (https://github.com/nmslib/hnswlib, Apache-2.0): adds
+// roofline_search_distfunc_calls, a per-thread count of the distance
+// evaluations that searchKnn and searchBaseLayerST make, and removes the
+// metric_distance_computations update from searchBaseLayerST.
+
 #pragma once
 
 #include "visited_list_pool.h"
@@ -14,17 +20,13 @@ namespace hnswlib {
 typedef unsigned int tableint;
 typedef unsigned int linklistsizeint;
 
-// roofline counter: thread-local count of distance evaluations on the
-// SEARCH path (searchKnn / searchBaseLayerST), incremented next to each
-// fstdistfunc_ call inside this header. Construction-time distance
-// evaluations (addPoint, mutuallyConnectNewElement, ...) do NOT
-// contribute. Consumers reset before a search and read after.
-//
-// Why thread_local instead of bumping the existing
-// HierarchicalNSW::metric_distance_computations atomic: under high
-// thread counts (e.g. T=32 OMP) the atomic shares a cache line across
-// threads, so the existing field cannot give a per-thread count and the
-// contended ++ would distort search timings used by the roofline model.
+// Per-thread count of distance evaluations on the search path (searchKnn and
+// searchBaseLayerST), counted wherever those functions call fstdistfunc_.
+// Distance evaluations during construction (addPoint,
+// mutuallyConnectNewElement, ...) are not counted. Callers reset it before a
+// search and read it after. It is thread_local because
+// HierarchicalNSW::metric_distance_computations is a single atomic shared by
+// all threads and cannot give a per-thread count.
 inline thread_local uint64_t roofline_search_distfunc_calls = 0;
 
 template<typename dist_t>
@@ -339,7 +341,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
             (!isMarkedDeleted(ep_id) && ((!isIdAllowed) || (*isIdAllowed)(getExternalLabel(ep_id))))) {
             char* ep_data = getDataByInternalId(ep_id);
             dist_t dist = fstdistfunc_(data_point, ep_data, dist_func_param_);
-            ++roofline_search_distfunc_calls;  // roofline counter: searchBaseLayerST entry distance
+            ++roofline_search_distfunc_calls;  // entry-point distance
             lowerBound = dist;
             top_candidates.emplace(dist, ep_id);
             if (!bare_bone_search && stop_condition) {
@@ -378,10 +380,9 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 //                bool cur_node_deleted = isMarkedDeleted(current_node_id);
             if (collect_metrics) {
                 metric_hops++;
-                // roofline counter: precise distance accounting -- the per-distfunc
-                // increment lives next to fstdistfunc_ at L389 (only for !visited
-                // neighbours), so the legacy "+= size" overcounts already-visited
-                // duplicates; intentionally dropped.
+                // metric_distance_computations is not updated here; the loop
+                // below computes a distance only for unvisited neighbors and
+                // counts each one in roofline_search_distfunc_calls.
             }
 
 #ifdef USE_SSE
@@ -404,7 +405,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
                     char *currObj1 = (getDataByInternalId(candidate_id));
                     dist_t dist = fstdistfunc_(data_point, currObj1, dist_func_param_);
-                    ++roofline_search_distfunc_calls;  // roofline counter: searchBaseLayerST per-neighbor (only !visited path)
+                    ++roofline_search_distfunc_calls;  // each unvisited neighbor
 
                     bool flag_consider_candidate;
                     if (!bare_bone_search && stop_condition) {
@@ -1292,7 +1293,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
 
         tableint currObj = enterpoint_node_;
         dist_t curdist = fstdistfunc_(query_data, getDataByInternalId(enterpoint_node_), dist_func_param_);
-        ++roofline_search_distfunc_calls;  // roofline counter: searchKnn initial entrypoint
+        ++roofline_search_distfunc_calls;  // entry-point distance
 
         for (int level = maxlevel_; level > 0; level--) {
             bool changed = true;
@@ -1304,7 +1305,7 @@ class HierarchicalNSW : public AlgorithmInterface<dist_t> {
                 int size = getListCount(data);
                 metric_hops++;
                 metric_distance_computations+=size;
-                roofline_search_distfunc_calls += static_cast<uint64_t>(size);  // roofline counter: searchKnn upper-layer descent (no visited check, so size == actual distfunc calls)
+                roofline_search_distfunc_calls += static_cast<uint64_t>(size);  // upper-layer descent: one distance per neighbor
 
                 tableint *datal = (tableint *) (data + 1);
                 for (int i = 0; i < size; i++) {

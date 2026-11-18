@@ -54,10 +54,12 @@ def main():
     centroids = read_fvecs(cen_path)
     n, d = centroids.shape
     k = min(max(1, round(n / inner_size)), n)
+    seed = int(np.random.default_rng().integers(1, 2**31 - 1))
     print(f"second-level k-means (GPU): num_centroids={n} dim={d} "
-          f"num_inner_clusters={k} metric={metric.upper()} gpus={ngpu}", flush=True)
+          f"num_inner_clusters={k} metric={metric.upper()} gpus={ngpu} seed={seed}",
+          flush=True)
     t0 = time()
-    km = faiss.Kmeans(d, k, niter=25, verbose=True, gpu=ngpu,
+    km = faiss.Kmeans(d, k, niter=25, verbose=True, gpu=ngpu, seed=seed,
                       max_points_per_centroid=256, spherical=(metric == "ip"))
     km.train(centroids)
     means = np.ascontiguousarray(km.centroids.reshape(k, d), dtype=np.float32)

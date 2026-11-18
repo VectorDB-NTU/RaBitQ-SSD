@@ -519,8 +519,9 @@ namespace rabitqlib::quant::rabitq_impl::ex_bits
         // repeatedly bound the states between two evaluated ones, discard
         // intervals that cannot beat the best certified score, and split the
         // rest at a midpoint. Returns false, leaving the answer to the event
-        // sweep, when two different states tie within rounding or the work
-        // limits are reached; it never returns an uncertified winner.
+        // sweep, whenever it cannot certify a winner (for example when two
+        // different states tie within rounding, or the work limits are
+        // reached); it never returns an uncertified winner.
         inline bool interval_search(const float *input, size_t dim, int max_code, double t_start,
                                     double t_end, double &best_t)
         {

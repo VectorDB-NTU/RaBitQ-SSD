@@ -9,10 +9,9 @@
 // pages of SECTOR_LEN (4 KiB) bytes.
 constexpr size_t SECTOR_LEN = 4096;
 
-// 4 KiB pages the index build fills into one buffer before a single pwrite.
-// The build buffers 1024 pages (4 MiB) per pwrite to <base>.ssd so parallel
-// writers do not serialize on the file system. The bytes written do not
-// depend on this value.
+// 4 KiB pages the index build fills into one buffer before a single pwrite:
+// the build writes <base>.ssd in pwrites of up to 1024 pages (4 MiB). The
+// bytes written do not depend on this value.
 constexpr size_t kSsdWriteChunkPages = 1024;
 
 // Maximum reads in flight per thread. Sizes the libaio context, submission

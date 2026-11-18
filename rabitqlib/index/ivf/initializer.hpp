@@ -17,24 +17,23 @@
 
 namespace rabitqlib::ivf {
 
-// Roofline counters: per-bucket thread-local counts of centroid coarse-search
-// work performed inside the most recent Initializer::centroids_distances call
-// on THIS thread. Each Initializer subtype writes whichever buckets apply to
-// its algorithm; the roofline work model maps each bucket to a different
-// flop-eq cost.
+// Coarse-search work counters: thread-local counts of the centroid
+// coarse-search work done by the most recent Initializer::centroids_distances
+// call on THIS thread. Every Initializer subtype writes all three on each call
+// with nprobe > 0; the ones that do not apply to its algorithm are 0.
 //
 //   last_full_l2_dists      : full L2 distance evaluations over padded_dim.
 //                             Flat: == num_cluster_; HNSW: == hnswlib
 //                             distfunc count; IRQ: inner-IVF Flat scan over
 //                             num_inner_cluster_ centroids.
 //   last_fastscan_attempts  : 1-bit fastscan + factor-correction attempts
-//                             over padded_dim (i.e. naive-scalar work of
-//                             2*padded_dim + 8 flop-eq each). Used by IRQ
-//                             for its embedded RaBitQ scan; 0 for Flat/HNSW.
-//   last_exbits_refines     : ex-bits boosting evaluations (2*ex_bits*
-//                             padded_dim + 6 flop-eq each). IRQ uses
-//                             ex_bits=8 (= kInnerExBits in initializer_irq);
-//                             0 for Flat/HNSW.
+//                             over padded_dim. Used by IRQ for its embedded
+//                             RaBitQ scan; 0 for Flat/HNSW.
+//   last_exbits_refines     : refine steps of IRQ's embedded scan: ex-bits
+//                             boosting with ex_bits=8 (= kInnerExBits in
+//                             initializer_irq), or an exact L2 with
+//                             RABITQ_IRQ_REFINE=full_precision; 0 for
+//                             Flat/HNSW.
 //
 // Multiple OMP threads share one Initializer instance (centroids_distances
 // is const), so these counters must be thread_local rather than per-instance.
@@ -172,7 +171,7 @@ class FlatInitializer : public Initializer {
             centroid_dist[i].id = i;
             centroid_dist[i].distance = std::sqrt(euclidean_sqr(query, centroid(i), dim_));
         }
-        // Roofline counters: Flat unconditionally evaluates a full L2
+        // Work counters: Flat unconditionally evaluates a full L2
         // distance for every centroid; no RaBitQ/ex-bits work.
         last_full_l2_dists = num_cluster_;
         last_fastscan_attempts = 0;
@@ -268,7 +267,7 @@ class HNSWInitializer : public Initializer {
         // efSearch scales with the request: 2*nprobe gives the beam the usual
         // 2x headroom over k without imposing a fixed cost at small nprobe.
         alg_hnsw_->setEf(2 * nprobe);
-        // Roofline counters: zero hnswlib's thread-local distance counter
+        // Work counters: zero hnswlib's thread-local distance counter
         // before the search; after searchKnn it holds the exact number of
         // distance evaluations performed during this call (entry distances +
         // upper-layer descent + base-layer beam search). The callsites that

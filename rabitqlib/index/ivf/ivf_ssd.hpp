@@ -260,8 +260,8 @@ namespace rabitqlib::ivf_ssd
         //   main_boost_dists         : # actual split_distance_boosting calls
         //                              = records that survived the cheap
         //                              mem_low_dist vs threshold early-exit.
-        //                              THIS is the real rerank compute (each
-        //                              costs 2*ex_bits*padded_dim + 6 flop-eq).
+        //                              THIS is the real rerank compute (one
+        //                              ex-bits distance evaluation each).
         //                              0 on the ex_bits_==0 && ssd_dim_==0 path
         //                              (no boosting: mem_est_dist used
         //                              directly). With the Raw store it counts
@@ -278,16 +278,16 @@ namespace rabitqlib::ivf_ssd
         uint64_t main_records_examined = 0;
         uint64_t main_boost_dists = 0;
         uint64_t main_knn_inserts = 0;
-        // Roofline buckets: centroid coarse-search work performed during
-        // Initializer::centroids_distances. Each bucket maps to a different
-        // flop-eq cost in the roofline work model (see work_model.hpp).
-        //   full_l2_dists      : full L2 (2*padded_dim flop-eq each).
+        // Coarse-search work counters: centroid coarse-search work performed
+        // during Initializer::centroids_distances.
+        //   full_l2_dists      : full L2 distances over padded_dim.
         //                        Flat / HNSW write here; IRQ writes its
         //                        inner Flat scan here.
-        //   fastscan_attempts  : 1-bit RaBitQ fastscan + factor correction
-        //                        (2*padded_dim + 8 flop-eq each). IRQ-only.
-        //   exbits_refines     : ex-bits boosting (2*ex_bits*padded_dim + 6
-        //                        flop-eq each). IRQ-only; ex_bits = 8.
+        //   fastscan_attempts  : 1-bit RaBitQ fastscan + factor correction.
+        //                        IRQ-only.
+        //   exbits_refines     : IRQ refine steps (ex-bits boosting with
+        //                        ex_bits = 8, or an exact L2 with
+        //                        RABITQ_IRQ_REFINE=full_precision). IRQ-only.
         uint64_t centroid_full_l2_dists = 0;
         uint64_t centroid_fastscan_attempts = 0;
         uint64_t centroid_exbits_refines = 0;

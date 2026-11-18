@@ -524,9 +524,8 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
         const size_t batch_block_bytes = BatchDataMap<float>::data_bytes(dim_);
         const size_t ex_one_bytes = ExDataMap<float>::data_bytes(dim_, kInnerExBits);
 
-        // Roofline counters: split into 3 buckets so the work model can
-        // charge each kind of coarse-search work at its correct flop-eq
-        // cost (full L2 vs 1-bit fastscan vs ex-bits refine). See
+        // Work counters, one per kind of coarse-search work (full L2,
+        // 1-bit fastscan, refine). See
         // rabitqlib::ivf::last_full_l2_dists / _fastscan_attempts /
         // _exbits_refines in initializer.hpp for the shared thread_locals
         // that all Initializer subtypes write.
@@ -570,7 +569,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
             }
         }
 
-        // Roofline: report this thread's centroid coarse-search work.
+        // Report this thread's centroid coarse-search work.
         rabitqlib::ivf::last_full_l2_dists = full_l2_dists;
         rabitqlib::ivf::last_fastscan_attempts = fastscan_attempts;
         rabitqlib::ivf::last_exbits_refines = exbits_refines;

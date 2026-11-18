@@ -109,15 +109,19 @@ def main() -> int:
     if num_inner_clusters > num_centroids:
         num_inner_clusters = num_centroids
 
+    seed = int(np.random.default_rng().integers(1, 2**31 - 1))
     print(
         f"second-level k-means: num_centroids={num_centroids} dim={dim} "
         f"inner_size={inner_size} num_inner_clusters={num_inner_clusters} "
-        f"metric={'IP' if metric == faiss.METRIC_INNER_PRODUCT else 'L2'}"
+        f"metric={'IP' if metric == faiss.METRIC_INNER_PRODUCT else 'L2'} "
+        f"seed={seed}",
+        flush=True,
     )
 
     t0 = time()
     index = faiss.index_factory(dim, f"IVF{num_inner_clusters},Flat", metric)
     index.verbose = True
+    index.cp.seed = seed
     index.train(centroids)
     print(f"  train time: {time() - t0:.2f}s")
 

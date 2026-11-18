@@ -105,8 +105,7 @@ OUTDIR_ENV=$INDEX_ROOT/yfcc1m/clustering \
 
 This produces `centroids_<C>.fvecs` and `clusterids_<C>.ivecs`. The number of
 clusters defaults to `ceil(N/1024)` — 977 here — and every later stage rederives
-it from the same file, so there is nothing to write down. At 100M scale this
-stage becomes the long pole, mostly in the assignment pass.
+it from the same file, so there is nothing to write down.
 
 ## 3. Build the index
 
@@ -173,15 +172,9 @@ For each `topk` and thread count the sweep searches for the operating points
 that reach a range of recall targets, then times each one. Output goes to
 `results/main_exp/`, one CSV per (topk, threads) cell plus, under `merged/`,
 one CSV joining every cell of that configuration; the columns are defined in
-[OUTPUT_SCHEMA.md](../OUTPUT_SCHEMA.md). Each cell's
-log also carries a per-operating-point table, of this shape:
-
-```
-nprobe         QPS   QPSnoCoarse      Recall     AvgIOReqs      AvgIOPages   ...
-    16      ...           ...        0.905           ...             ...
-    32      ...           ...        0.951           ...             ...
-    64      ...           ...        0.982           ...             ...
-```
+[OUTPUT_SCHEMA.md](../OUTPUT_SCHEMA.md). Each cell's log also carries a
+per-operating-point table with `nprobe`, `QPS`, `QPSnoCoarse`, `Recall`,
+`AvgIOReqs` and `AvgIOPages`.
 
 Reading it: `nprobe` is how many clusters the search visited. Increasing it
 adds search work and typically improves recall. Pick a row that reaches the
@@ -217,9 +210,8 @@ may use (default 128), and `INDEX_ROOT` to a device with room for the index.
 The build streams the dataset within that budget, so it does not need to hold
 the vectors in memory.
 
-Expect the clustering and the index build to be the long poles: on a 64-core
-machine the full 98.7M set took about 50 minutes to cluster and 30 minutes to
-build, with the search sweep on top of that.
+Run clustering and index construction before starting the search sweep, and
+keep their logs and generated reports with the resulting index.
 
 ## Where to go next
 

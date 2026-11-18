@@ -159,7 +159,8 @@ static inline size_t count_correct_with_ties(const PID *res_ids, const PID *gt_i
 }
 
 // ---- per-query latency / metrics CSV helpers ----
-// Percentile by linear interpolation on an ASCENDING-sorted sample vector.
+// Percentile of an ASCENDING-sorted sample vector, with the default
+// definition of numpy.percentile.
 // p in [0,1]; p999 needs >= 1000 samples to be statistically meaningful
 // (with fewer it degenerates toward max).
 static double percentile_sorted(const std::vector<double> &sorted, double p)
@@ -355,11 +356,9 @@ static double avg_per_query(const std::vector<SearchStats> &stats, Getter get)
 }
 
 // Per-query average of `stats[i].centroid_exbits_refines`. For IRQ this
-// counts how many first-level centroids the inner-IVF coarse step ran
-// `split_distance_boosting` on per query — i.e. the survivors of the
-// `lower_dist < threshold` low-bound prune in scan_batch. Each such call
-// costs O(padded_dim) for the ex-code SIMD inner product, so this counter
-// tracks the coarse-step cost that grows with nprobe.
+// counts the first-level centroids that passed the `lower_dist < threshold`
+// 1-bit lower-bound prune in scan_batch and were refined (ex-bits boosting,
+// or an exact L2 with RABITQ_IRQ_REFINE=full_precision); 0 for Flat/HNSW.
 static double compute_avg_centroid_exbits_refines(
     const std::vector<SearchStats> &stats)
 {
@@ -392,8 +391,9 @@ static int run(int argc, char **argv)
                   << "              csv=<path>        write the result CSV, one row per nprobe (see OUTPUT_SCHEMA.md).\n"
                   << "                                Columns it cannot fill (cpu_util_pct,peak_rss_mb,resident_index_mb,\n"
                   << "                                index_ssd_bytes) are left BLANK for the driver to fill by run_id.\n"
-                  << "              method_csv=<path> write method-specific diagnostics (scan funnel /\n"
-                  << "                                roofline buckets); NOT part of the result schema.\n"
+                  << "              method_csv=<path> write method-specific diagnostics (scan funnel,\n"
+                  << "                                coarse-search counters, coarse and drain times);\n"
+                  << "                                NOT part of the result schema.\n"
                   << "              run_id=<str>      run identifier (default: <dataset>_topk<K>_T<threads>)\n"
                   << "              system=<str>      system label for the CSV (default: RaBitQ-SSD)\n"
                   << "              metric_space=<l2|ip|cosine>  recorded in the CSV (default: l2)\n"
@@ -441,8 +441,9 @@ static int run(int argc, char **argv)
     size_t topk = 100;
     // csv=<path> writes the result CSV defined by OUTPUT_SCHEMA.md (the only comparison
     // output). method_csv=<path> writes the method-specific diagnostics
-    // (scan funnel / roofline buckets) -- NOT part of the
-    // result schema. dataset= overrides the auto-derived dataset label.
+    // (scan funnel, coarse-search counters, coarse and drain times) -- NOT
+    // part of the result schema. dataset= overrides the auto-derived dataset
+    // label.
     std::string csv_file;
     std::string method_csv_file;
     std::string dataset_name;
@@ -813,7 +814,7 @@ static int run(int argc, char **argv)
     // Effective bandwidth/IOPS (internal counters / timed wall) per nprobe.
     std::vector<std::vector<double>> all_eff_bw(test_round, std::vector<double>(length));
     std::vector<std::vector<double>> all_eff_iops(test_round, std::vector<double>(length));
-    // Roofline coarse-search work buckets (method_ext only): full-L2 distances
+    // Coarse-search work counters (method_ext only): full-L2 distances
     // and 1-bit fastscan attempts (IRQ-only).
     std::vector<std::vector<double>> all_full_l2(test_round, std::vector<double>(length));
     std::vector<std::vector<double>> all_fastscan_att(test_round, std::vector<double>(length));
@@ -1105,9 +1106,9 @@ static int run(int argc, char **argv)
     }
 
     // ---- method_ext CSV (method-specific diagnostics; NOT part of the schema) ----
-    // Joins to the result CSV on run_id + op_param. Holds the scan funnel and
-    // the roofline coarse-search buckets: counters the engine maintains anyway,
-    // pooled after timing ends.
+    // Joins to the result CSV on run_id + op_param. Holds the scan funnel, the
+    // coarse-search work counters and the coarse and drain times, which the
+    // engine records anyway; they are pooled after timing ends.
     if (!method_csv_file.empty())
     {
         std::ofstream mcsv(method_csv_file);

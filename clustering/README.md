@@ -84,7 +84,6 @@ scripts.
 
 The stage has two halves, and they cost very differently. Training the `C`
 centroids reads only the sample; assigning all `N` base points reads everything.
-On a 98.7M-vector run the split was about 9 minutes to train and 43 to assign.
 
 Three flags exist to exploit that asymmetry, and they only make sense together:
 
@@ -101,22 +100,24 @@ So the loop is: train once, sweep to find the knee, then do the real run.
 python two_level_kmeans.py --base .../train.fbin --out-dir DIR \
     --cluster-only --efs-sweep 16,32,64,128,256      # -> efs_sweep_C<C>.json
 
-# 2. the real run, with the efSearch you picked
-DATA_ENV=... OUTDIR_ENV=DIR ./run_kmeans.sh <dataset>
+# 2. reuse that checkpoint, with the efSearch you picked (64 in this example)
+python two_level_kmeans.py --base .../train.fbin --out-dir DIR \
+    --hnsw-efs 64 \
+    --centroids-from "DIR/trained_centroids_<C>.fvecs"
 ```
 
 **`--efs-sweep` requires `--cluster-only`** — the sweep runs on the freshly
 trained centroids, in exactly the gap where the full assignment would otherwise
-begin, so there is nowhere else to put it. Passing it alone now stops with that
-message rather than being silently ignored.
+begin, so there is nowhere else to put it. Passing it without
+`--cluster-only` stops with that message.
 
 **`--cluster-only` does not produce a usable clustering.** It writes
 `trained_centroids_<C>.fvecs`; the index is built from `centroids_<C>.fvecs`,
 which is the per-cluster *mean* of the assigned vectors and therefore only
 exists after a full run. `build_index.sh` looks for the latter.
 
-The runner's default of 64 was chosen this way: recall@1 climbs steeply to about
-64 and then flattens while assignment time keeps growing.
+The runner uses efSearch 64. Call the Python driver directly to choose another
+value with `--hnsw-efs`.
 
 ## Second-level k-means
 
