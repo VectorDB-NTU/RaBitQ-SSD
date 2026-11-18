@@ -3,12 +3,35 @@
 #include <sys/stat.h>
 
 #include <cassert>
+#include <cerrno>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
+#include <string>
 #include <type_traits>
 
 namespace rabitqlib {
+// Flush and close an index file written through `out`. If any write, the
+// flush or the close failed (for example on a full disk), print
+// "<path>: write failed: <reason>", remove the partial file (so that a later
+// build does not reuse it) and exit with status 1.
+inline void close_checked(std::ofstream& out, const std::string& path) {
+    out.flush();
+    const bool written = static_cast<bool>(out);
+    const int write_errno = errno;
+    out.close();
+    if (!written || out.fail()) {
+        const int err = written ? errno : write_errno;
+        std::cerr << path << ": write failed: "
+                  << (err != 0 ? std::strerror(err) : "unknown error") << '\n';
+        std::remove(path.c_str());
+        std::exit(1);
+    }
+}
+
 // get num of bytes
 inline size_t get_filesize(const char* filename) noexcept {
     try {

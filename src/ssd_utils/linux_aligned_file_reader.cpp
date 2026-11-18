@@ -54,16 +54,12 @@ void *LinuxAlignedFileReader::get_ctx()
 
 void LinuxAlignedFileReader::register_thread()
 {
+    // ctx_create throws if io_setup fails. The search threads run inside
+    // batch_search, which reports the first error once after its parallel loop.
     if (ioctx::ctx == nullptr)
     {
         ioctx::ctx = rabitqlib::io_backend::ctx_create(
             static_cast<unsigned>(kMaxReadsInFlight));
-        if (ioctx::ctx == nullptr)
-        {
-            LOG(ERROR) << "io_backend ctx_create (" << rabitqlib::io_backend::name()
-                       << ") failed";
-            exit(1);
-        }
     }
 }
 

@@ -1857,7 +1857,7 @@ namespace rabitqlib::ivf_ssd
                      static_cast<long>(mem_batch_data_bytes(cluster_sizes)));
         output.write(reinterpret_cast<const char *>(ids_),
                      static_cast<long>(ids_bytes()));
-        output.close();
+        close_checked(output, base_index_file);
     }
 
     // Read just the <base> header (metadata + rotator + rotated centroids),
@@ -2003,7 +2003,7 @@ namespace rabitqlib::ivf_ssd
         output.write(reinterpret_cast<const char *>(&fp), sizeof(uint64_t));
 
         initer_->save(output, coarse_index_file.c_str());
-        output.close();
+        close_checked(output, coarse_index_file);
     }
 
     // Full base load for querying: metadata + rotator + rotated centroids +
@@ -2197,6 +2197,15 @@ namespace rabitqlib::ivf_ssd
 
         build_initializer();
         initer_->load(input, coarse_index_file.c_str());
+        // The flat quantizer reads its centroids from this stream (IRQ and
+        // HNSW read their own sidecar files), so a short file shows up here.
+        if (!input)
+        {
+            LOG(ERROR) << coarse_index_file
+                       << ": short read of the coarse quantizer; the file is "
+                          "truncated";
+            std::exit(1);
+        }
         input.close();
         std::cout << "Coarse quantizer loaded\n";
     }
@@ -2512,6 +2521,11 @@ namespace rabitqlib::ivf_ssd
         // these are the only three on the query path, and none is inside a loop.
         StopW total_stopw;
 
+        // The thread's libaio context is created on its first query and
+        // throws if io_setup fails. Taking it before the pooled buffers keeps
+        // the pools intact when that happens.
+        void *ctx = file_reader_->get_ctx();
+
         QueryBuffer *query_buf = pop_query_buf();
         query_buf->reset();
         auto *io_queue = pop_ioqueue_buf();
@@ -2520,7 +2534,6 @@ namespace rabitqlib::ivf_ssd
         // header): identical for every thread, cached after the first call.
         const size_t qd_cap = qd_per_thread();
 
-        void *ctx = file_reader_->get_ctx();
         io_queue->reset(query_buf, file_reader_.get(), ctx, empty_ssd_, stats);
 
         rotator_->rotate(query, query_buf->rotated_query);
@@ -2532,12 +2545,41 @@ namespace rabitqlib::ivf_ssd
                       query_buf->raw_query + padded_dim_, 0.0F);
         }
 
+        // Every slot starts as "no cluster", so a slot the coarse quantizer
+        // leaves unfilled cannot keep an id from an earlier query.
         auto &centroid_dist = query_buf->centroid_dist;
-        centroid_dist.resize(nprobe);
+        centroid_dist.assign(
+            nprobe, AnnCandidate<float>(std::numeric_limits<PID>::max(),
+                                        std::numeric_limits<float>::max()));
         StopW coarse_stopw;
         initer_->centroids_distances(query_buf->rotated_query, nprobe,
                                      centroid_dist);
         const double coarse_us = coarse_stopw.get_elapsed_micro();
+
+        // Each of the nprobe probes needs a cluster. A coarse quantizer that
+        // returns fewer is an error, not a shorter search.
+        size_t n_found = 0;
+        for (size_t i = 0; i < nprobe; ++i)
+        {
+            n_found += (centroid_dist[i].id < num_cluster_) ? 1 : 0;
+        }
+        if (n_found < nprobe)
+        {
+            push_query_buf(query_buf);
+            push_ioqueue_buf(io_queue);
+            const char *kind =
+                coarse_kind_ == CoarseKind::IRQ
+                    ? "irq"
+                    : (coarse_kind_ == CoarseKind::HNSW ? "hnsw" : "flat");
+            throw std::runtime_error(
+                std::string("the ") + kind + " coarse quantizer returned " +
+                std::to_string(n_found) + " of the nprobe=" +
+                std::to_string(nprobe) +
+                " clusters a query needs; use a smaller nprobe" +
+                (coarse_kind_ == CoarseKind::IRQ
+                     ? " or a larger RABITQ_IRQ_OUTER_MULT"
+                     : ""));
+        }
         if (stats != nullptr)
         {
             // Roofline buckets: each thread_local is written by the
@@ -2663,12 +2705,40 @@ namespace rabitqlib::ivf_ssd
     {
         nprobe = std::min(nprobe, num_cluster_);
 
+        // An error in one search thread (for example a failed io_setup, or a
+        // coarse quantizer that returns fewer than nprobe clusters) stops the
+        // remaining queries. The first error is rethrown here, once, after the
+        // parallel loop, instead of from every thread inside it.
+        std::exception_ptr first_error;
+        std::atomic<bool> stop{false};
 #pragma omp parallel for schedule(dynamic, 1)
         for (size_t i = 0; i < nqueries; ++i)
         {
-            search_one(queries + i * dim_, topk, nprobe,
-                       results + i * topk, use_hacc,
-                       stats ? &stats[i] : nullptr);
+            if (stop.load(std::memory_order_relaxed))
+            {
+                continue;
+            }
+            try
+            {
+                search_one(queries + i * dim_, topk, nprobe,
+                           results + i * topk, use_hacc,
+                           stats ? &stats[i] : nullptr);
+            }
+            catch (...)
+            {
+#pragma omp critical(ivf_ssd_search_error)
+                {
+                    if (!first_error)
+                    {
+                        first_error = std::current_exception();
+                    }
+                }
+                stop.store(true, std::memory_order_relaxed);
+            }
+        }
+        if (first_error)
+        {
+            std::rethrow_exception(first_error);
         }
     }
     inline void IvfSsdIndex::estimate_batch(

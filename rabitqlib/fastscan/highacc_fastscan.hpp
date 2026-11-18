@@ -28,13 +28,8 @@ inline void transfer_lut_hacc(const uint16_t* lut, size_t dim, uint8_t* hc_lut) 
     constexpr size_t kRegBits = 256;
 #else
     // Neither AVX2 nor AVX-512. The packing below still compiles, but the
-    // matching accumulate_hacc kernel has no scalar version, so a search on
-    // such a build cannot work. Report it once instead of failing the build:
-    // Faiss compiles its sources at a baseline SIMD level and selects the
-    // kernel at run time, so a hard static_assert here makes the file
-    // impossible to add to libfaiss at all. Remove this branch once the
-    // kernels sit behind Faiss dynamic dispatch and a SIMDLevel::NONE
-    // implementation exists.
+    // accumulate_hacc kernel has no scalar version, so a fastscan search
+    // cannot run on such a build.
     constexpr size_t kRegBits = 256;
     LOG(ERROR) << "AVX2 or AVX-512 is required for fastscan; this build "
                   "cannot run a fastscan search";

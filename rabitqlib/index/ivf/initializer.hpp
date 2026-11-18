@@ -2,8 +2,11 @@
 
 #include <cmath>
 #include <cstddef>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
+#include <limits>
 #include <string>
 #include <thread>
 #include <vector>
@@ -207,6 +210,31 @@ class HNSWInitializer : public Initializer {
     int ef_construction_ = 400;
     hnswlib::HierarchicalNSW<float>* alg_hnsw_ = nullptr;
     hnswlib::L2Space space_;
+    // Cluster id -> hnswlib internal id. hnswlib numbers the points in the
+    // order the parallel inserts reach it, so the two ids differ.
+    std::vector<hnswlib::tableint> internal_id_;
+
+    // Fill internal_id_ from the cluster ids stored as labels in the graph,
+    // which must hold exactly one point per cluster.
+    void map_labels() {
+        constexpr hnswlib::tableint kNone = std::numeric_limits<hnswlib::tableint>::max();
+        internal_id_.assign(num_cluster_, kNone);
+        const size_t count = alg_hnsw_->getCurrentElementCount();
+        bool ok = (count == num_cluster_);
+        for (size_t i = 0; ok && i < count; ++i) {
+            const auto internal = static_cast<hnswlib::tableint>(i);
+            const hnswlib::labeltype label = alg_hnsw_->getExternalLabel(internal);
+            ok = label < num_cluster_ && internal_id_[label] == kNone;
+            if (ok) {
+                internal_id_[label] = internal;
+            }
+        }
+        if (!ok) {
+            std::cerr << "HNSW coarse quantizer: the graph does not hold exactly one "
+                         "point per cluster\n";
+            std::exit(1);
+        }
+    }
 
    public:
     explicit HNSWInitializer(size_t d, size_t k) : Initializer(d, k), space_(d) {
@@ -223,11 +251,15 @@ class HNSWInitializer : public Initializer {
         parallel_for(start, rows, num_threads, [&](size_t row, size_t /*thread_id*/) {
             alg_hnsw_->addPoint(cent + (row * dim_), row);
         });
+        map_labels();
         std::cout << "Inserted vectors into hnsw...\n" << std::flush;
     }
 
+    // `id` is a cluster id (the hnswlib label), not an hnswlib internal id.
     [[nodiscard]] const float* centroid(PID id) const override {
-        return reinterpret_cast<const float*>(alg_hnsw_->getDataByInternalId(id));
+        return reinterpret_cast<const float*>(
+            alg_hnsw_->getDataByInternalId(internal_id_[id])
+        );
     }
 
     void centroids_distances(
@@ -273,6 +305,7 @@ class HNSWInitializer : public Initializer {
         std::string hnsw(filename);
         hnsw += ".hnsw";
         alg_hnsw_->loadIndex(hnsw, &space_, num_cluster_);
+        map_labels();
     }
 
     ~HNSWInitializer() override { delete alg_hnsw_; }

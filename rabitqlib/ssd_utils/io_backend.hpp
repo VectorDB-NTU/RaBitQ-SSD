@@ -14,8 +14,11 @@
 // it writes the index with ordinary pwrite()/ofstream -- so the backend never
 // affects index construction or the on-disk format.
 
+#include <cerrno>
 #include <cstdint>
 #include <cstring>
+#include <stdexcept>
+#include <string>
 
 #include "rabitqlib/ssd_utils/ssd_index_defs.hpp" // kMaxReadsInFlight, crash()
 #include "rabitqlib/ssd_utils/log.hpp"
@@ -34,16 +37,19 @@ inline const char *name()
 
 // ---- per-thread context lifecycle -----------------------------------------
 // Create a per-thread IO context and return it as an opaque handle (void*).
-// queue_depth maps to the libaio io_setup nr_events. Returns nullptr on
-// failure.
+// queue_depth maps to the libaio io_setup nr_events. Throws
+// std::runtime_error when io_setup fails; batch_search reports the first such
+// error once, after its parallel loop.
 inline void *ctx_create(unsigned queue_depth)
 {
     io_context_t aio = nullptr;
     const int ret = io_setup(static_cast<int>(queue_depth), &aio);
     if (ret < 0)
     {
-        LOG(ERROR) << "io_setup failed: " << strerror(-ret);
-        return nullptr;
+        throw std::runtime_error(
+            std::string("io_setup failed: ") + strerror(-ret) +
+            (ret == -EAGAIN ? " (too many libaio contexts, see fs.aio-max-nr)"
+                            : ""));
     }
     // io_context_t is itself a pointer, so it round-trips through void* cleanly.
     return reinterpret_cast<void *>(aio);

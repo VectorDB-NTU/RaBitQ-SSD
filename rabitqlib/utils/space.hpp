@@ -4,6 +4,7 @@
 #include <immintrin.h>
 #include <omp.h>
 
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdint>
@@ -24,6 +25,11 @@ void scalar_quantize_normal(
     float lo,
     float delta
 ) {
+    // A constant range (delta == 0) is represented by zero codes.
+    if (delta == 0.0F) {
+        std::fill_n(result, dim, T{0});
+        return;
+    }
     float one_over_delta = 1.0F / delta;
 
     ConstRowMajorArrayMap<float> v0(vec0, 1, static_cast<long>(dim));
@@ -52,6 +58,10 @@ inline void scalar_quantize_optimized<uint8_t>(
     float lo,
     float delta
 ) {
+    if (delta == 0.0F) {
+        std::fill_n(result, dim, uint8_t{0});
+        return;
+    }
 #if defined(__AVX512F__)
     size_t mul16 = dim - (dim & 0b1111);
     size_t i = 0;
@@ -80,6 +90,10 @@ inline void scalar_quantize_optimized<uint16_t>(
     float lo,
     float delta
 ) {
+    if (delta == 0.0F) {
+        std::fill_n(result, dim, uint16_t{0});
+        return;
+    }
 #if defined(__AVX512F__)
     size_t mul16 = dim - (dim & 0b1111);
     size_t i = 0;

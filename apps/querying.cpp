@@ -376,7 +376,7 @@ static double compute_avg_centroid_exbits_refines(
     return total / static_cast<double>(stats.size());
 }
 
-int main(int argc, char **argv)
+static int run(int argc, char **argv)
 {
     if (argc < 7)
     {
@@ -1193,6 +1193,7 @@ int main(int argc, char **argv)
                   << std::setw(12) << (iop > 0.0 ? ins / iop : 0.0)
                   << std::setw(12) << avg_recall[i] << '\n';
     }
+    return 0;
 }
 
 // Read a numeric environment variable, falling back to `def` when it is unset,
@@ -1387,4 +1388,19 @@ static std::vector<size_t> get_nprobes(
               << "] step " << rt_step << " | >" << plateau << " keep " << high_keep
               << " | map probes=" << map.size() << '\n';
     return keep;
+}
+
+// Errors raised inside the parallel search (a failed io_setup, or a coarse
+// quantizer that returns fewer than nprobe clusters) reach this point once.
+int main(int argc, char **argv)
+{
+    try
+    {
+        return run(argc, argv);
+    }
+    catch (const std::exception &e)
+    {
+        std::cerr << "[FATAL] " << e.what() << '\n';
+        return 1;
+    }
 }

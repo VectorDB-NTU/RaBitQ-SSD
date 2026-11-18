@@ -675,7 +675,7 @@ class IvfRabitqInitializer : public rabitqlib::ivf::Initializer {
             out.write(reinterpret_cast<const char*>(centroid_norms_.data()),
                       static_cast<std::streamsize>(sizeof(float) * nc));
         }
-        out.close();
+        close_checked(out, path);
     }
 
     void load(std::ifstream& /*input*/, const char* filename) override {
