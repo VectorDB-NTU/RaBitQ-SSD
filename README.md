@@ -113,7 +113,6 @@ clustering, the index and the search agree without a config file:
 | in-RAM dims `memdim` | the full vector width, rounded up to a multiple of 64 | `MEMDIM_ENV` (a multiple of 64) |
 | metric | `l2` | `METRIC_ENV=ip` |
 | bits per dimension `B` | 9 — one sign bit plus 8 of extra precision | `B_ENV` (2–9) |
-| cluster layout | `ordered` — points sorted by distance to their centroid | `ORDER_ENV=unordered` |
 | SSD records | `exbits` — the rest of the 1-bit code plus `B-1`-bit extra-precision codes | `STORE_ENV=raw` |
 
 All of them appear in the index directory and file names, so **an override must be
@@ -121,6 +120,9 @@ repeated across stages**. Omitting one can either produce a missing-file error
 or select an existing index built with the defaults. They are derived in one place
 ([`scripts/_params.sh`](scripts/_params.sh)) precisely so the build and the
 search cannot compose different names.
+
+Points within each cluster are stored in centroid-distance order, with point
+IDs breaking equal-distance ties.
 
 Lower `B` reduces the SSD footprint and re-ranking precision. `STORE_ENV=raw`
 stores each vector as given instead, float32 or uint8, and re-ranks with exact

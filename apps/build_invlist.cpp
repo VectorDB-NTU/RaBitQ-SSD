@@ -51,22 +51,6 @@ static bool parse_bool(const std::string &s, bool &out)
     return false;
 }
 
-static bool parse_order_mode(const std::string &s, index_type::ClusterOrderMode &out)
-{
-    const std::string v = to_lower(s);
-    if (v == "unordered")
-    {
-        out = index_type::ClusterOrderMode::Unordered;
-        return true;
-    }
-    if (v == "ordered" || v == "orderedbycentroiddistance" || v == "ordered_by_centroid_distance")
-    {
-        out = index_type::ClusterOrderMode::OrderedByCentroidDistance;
-        return true;
-    }
-    return false;
-}
-
 int main(int argc, char **argv)
 {
     if (argc < 7)
@@ -86,7 +70,6 @@ int main(int argc, char **argv)
                   << "options, in any order:\n"
                   << "  l2 | ip                  metric, l2 by default\n"
                   << "  true | false             faster quantization, false by default\n"
-                  << "  unordered | ordered      cluster order mode, unordered by default\n"
                   << "  <integer>                MEMDIM: memory-resident bincode dim, a multiple\n"
                   << "                           of 64; default is the padded vector width\n"
                   << "  mem_budget_gb=<GiB>      build-time DRAM ceiling. When set, the dataset is\n"
@@ -100,6 +83,7 @@ int main(int argc, char **argv)
                   << "                           uint8), re-ranked with exact distances\n"
                   << "  rows=<N>                 index only the first N rows of <data>; the\n"
                   << "                           cluster ids must cover exactly those N\n\n"
+                  << "Points in each cluster are sorted by centroid distance, with ties by point id.\n"
                   << "This builds ONLY the inverted list. Build a coarse quantizer separately\n"
                   << "with build_coarse <base_index> <coarse_index> <kind>.\n"
                   << "Full reference: docs/cli_reference.md\n";
@@ -115,7 +99,6 @@ int main(int argc, char **argv)
 
     rabitqlib::MetricType metric_type = rabitqlib::METRIC_L2;
     bool faster_quant = false;
-    index_type::ClusterOrderMode order_mode = index_type::ClusterOrderMode::Unordered;
     size_t mem_dim = 0;
     // Build-time DRAM budget (total RSS ceiling), in GiB. 0 = unset selects the
     // full-DRAM path (loads the whole dataset, then quantizes). When set, the
@@ -230,13 +213,6 @@ int main(int argc, char **argv)
             continue;
         }
 
-        index_type::ClusterOrderMode parsed_order_mode = index_type::ClusterOrderMode::Unordered;
-        if (parse_order_mode(lower, parsed_order_mode))
-        {
-            order_mode = parsed_order_mode;
-            continue;
-        }
-
         try
         {
             size_t pos = 0;
@@ -250,14 +226,13 @@ int main(int argc, char **argv)
         }
         catch (const std::exception &)
         {
-            std::cerr << "Invalid optional arg: " << arg << " (expect metric/ip|l2, faster true|false, order unordered|ordered, store=exbits|raw, mem_budget_gb=<GiB>, rows=<N>, or MEMDIM)\n";
+            std::cerr << "Invalid optional arg: " << arg << " (expect metric/ip|l2, faster true|false, store=exbits|raw, mem_budget_gb=<GiB>, rows=<N>, or MEMDIM)\n";
             return 1;
         }
     }
 
     std::cout << "Metric Type: " << ((metric_type == rabitqlib::METRIC_IP) ? "IP" : "L2") << '\n';
     std::cout << "Faster quantization: " << (faster_quant ? "true" : "false") << '\n';
-    std::cout << "Cluster order mode: " << ((order_mode == index_type::ClusterOrderMode::OrderedByCentroidDistance) ? "ordered" : "unordered") << '\n';
     // The input's value width comes from its extension; a raw store keeps it.
     const rabitqlib::VecElemType data_elem = rabitqlib::vector_elem_type(data_file);
     std::cout << "Input values: " << rabitqlib::elem_type_name(data_elem) << '\n';
@@ -400,12 +375,12 @@ int main(int argc, char **argv)
     if (!streaming)
     {
         ivf_ssd_index.construct_invlist(data.data(), centroids.data(),
-                                        cids.data(), faster_quant, order_mode);
+                                        cids.data(), faster_quant);
     }
     else
     {
         ivf_ssd_index.construct_invlist_streaming(
-            data_file, centroids.data(), cids.data(), faster_quant, order_mode,
+            data_file, centroids.data(), cids.data(), faster_quant,
             mem_budget_bytes, prefix_rows);
     }
 

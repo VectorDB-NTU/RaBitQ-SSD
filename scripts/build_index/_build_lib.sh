@@ -51,7 +51,7 @@ IVF_CENTROIDS=${REPO}/clustering/ivf_centroids.py
 # Python with faiss + numpy (see clustering/README.md).
 PY=${PYTHON_ENV:-python3}
 
-# ORDER, B and STORE come from derive_params (they appear in the index name).
+# B and STORE come from derive_params (they appear in the index name).
 FASTER=${FASTER_ENV:-false}
 STORE=${STORE:-exbits}
 # total_bits is build_invlist's 4th argument. The raw store has no
@@ -94,7 +94,7 @@ build_index() {
     echo "================ build ${DATASET} C=${C} ${STORE_DESC%% *} memdim=${MEMDIM} metric=${METRIC} coarse=${COARSE_KIND} ================"
     echo "  start  : $(date -Is)"
     echo "  outdir : ${OUTDIR}"
-    echo "  cfg    : ${STORE_DESC} metric=${METRIC} order=${ORDER} faster=${FASTER} memdim=${MEMDIM} budget=${BUDGET_GB}GiB inner=${INNER}"
+    echo "  cfg    : ${STORE_DESC} metric=${METRIC} faster=${FASTER} memdim=${MEMDIM} budget=${BUDGET_GB}GiB inner=${INNER}"
     echo "==============================================================================="
 
     local LOG
@@ -121,10 +121,10 @@ build_index() {
     else
         echo "[invlist-C] start $(date -Is)"
         LOG=${OUTDIR}/build_invlist.log
-        echo "cmd: ${INVLIST_BIN} ${DATA} ${CEN} ${CIDS} ${TOTAL_BITS} ${BASE} ${SSD} ${METRIC} ${FASTER} ${ORDER} ${MEMDIM} mem_budget_gb=${BUDGET_GB} store=${STORE}${ROWS_OPT:+ ${ROWS_OPT}}" | tee "${LOG}"
+        echo "cmd: ${INVLIST_BIN} ${DATA} ${CEN} ${CIDS} ${TOTAL_BITS} ${BASE} ${SSD} ${METRIC} ${FASTER} ${MEMDIM} mem_budget_gb=${BUDGET_GB} store=${STORE}${ROWS_OPT:+ ${ROWS_OPT}}" | tee "${LOG}"
         /usr/bin/time -v "${INVLIST_BIN}" \
             "${DATA}" "${CEN}" "${CIDS}" "${TOTAL_BITS}" "${BASE}" "${SSD}" \
-            "${METRIC}" "${FASTER}" "${ORDER}" "${MEMDIM}" "mem_budget_gb=${BUDGET_GB}" \
+            "${METRIC}" "${FASTER}" "${MEMDIM}" "mem_budget_gb=${BUDGET_GB}" \
             "store=${STORE}" ${ROWS_OPT:+"${ROWS_OPT}"} \
             >> "${LOG}" 2>&1 || { echo "[FATAL] build_invlist failed (see ${LOG})"; exit 1; }
         echo "[invlist-C] done $(date -Is)  base=$(stat -c %s "${BASE}") ssd=$(stat -c %s "${SSD}")"

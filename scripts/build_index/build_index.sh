@@ -11,7 +11,7 @@
 # vectors are train.fbin (float32), or train.u8bin or train.bvecs (uint8).
 # N_ENV indexes only the first N_ENV of them. Every dataset is
 # built the same way (IRQ coarse quantizer); C, the metric, the total bit
-# width, the SSD store, the cluster layout and the RAM/SSD split point are all
+# width, the SSD store and the RAM/SSD split point are all
 # derived from the base vectors by scripts/_params.sh. The build phases, the
 # variable contract and the remaining env overrides are documented in
 # _build_lib.sh.
@@ -71,8 +71,8 @@ CIDS=${CL}/clusterids_${C}${METRIC_TAG}.ivecs
 # STORE_TAG is B<bits> for the default ex-code store and raw for the raw store.
 # N_TAG is _n<N> when N_ENV indexes a prefix of the file, so two prefixes of
 # one file never share an index; otherwise it is empty.
-OUTDIR=${IDXROOT}/${DATASET}/idx_C${C}${N_TAG}_cpu_${STORE_TAG}_memdim${MEMDIM}_${METRIC}_${ORDER}
-STEM=ss_${DATASET}_C${C}${N_TAG}_cpu_${STORE_TAG}_memdim${MEMDIM}_${METRIC}_${ORDER}
+OUTDIR=${IDXROOT}/${DATASET}/idx_C${C}${N_TAG}_cpu_${STORE_TAG}_memdim${MEMDIM}_${METRIC}_ordered
+STEM=ss_${DATASET}_C${C}${N_TAG}_cpu_${STORE_TAG}_memdim${MEMDIM}_${METRIC}_ordered
 
 source "${SCRIPT_DIR}/_build_lib.sh"
 build_index

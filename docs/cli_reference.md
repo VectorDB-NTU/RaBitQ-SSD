@@ -50,30 +50,30 @@ Optional arguments, recognised by their form rather than their position:
    clustering used, and the one you search with.
 8. **`true`** or **`false`** (default `false`): faster quantization. Trades a
    little code quality for build time.
-9. **`unordered`** or **`ordered`** (default `unordered`): whether points
-   within a cluster are stored in centroid-distance order. `ordered` is what
-   the scripts build.
-10. **a bare integer** (default: the padded vector width): `memdim`, how many
+9. **a bare integer** (default: the padded vector width): `memdim`, how many
     leading dimensions of the 1-bit code stay resident in RAM. The remaining
     dimensions and the extra-precision codes are stored on SSD. Must be a
     multiple of 64. Lowering it reduces the in-RAM footprint and can increase
     SSD reads per query.
-11. **`mem_budget_gb=<GiB>`** (default: unset): build within this DRAM ceiling.
+10. **`mem_budget_gb=<GiB>`** (default: unset): build within this DRAM ceiling.
     Unset loads the whole dataset and then quantizes, which needs room for the
     dataset in fp32. When set, the dataset is streamed instead and never held
     whole. **The resulting index is the same either way** — this only decides
     whether the build fits in memory. Keyed rather than positional
     because the bare-integer slot is already `memdim`.
-12. **`store=exbits`** or **`store=raw`** (default `exbits`): what the SSD
+11. **`store=exbits`** or **`store=raw`** (default `exbits`): what the SSD
     records hold. `exbits` stores the dimensions of the 1-bit code beyond
     `memdim` plus the extra-precision codes, and re-ranks with the estimated
     distance. `raw` stores every vector as given, float32 or uint8 according to
     the input, zero-padded to a multiple of 64 dimensions, and re-ranks with the
     exact distance; `total_bits` is then ignored. The choice is recorded in the
     base index, so `querying` needs no matching flag.
-13. **`rows=<N>`** (default: every row): index only the first `N` rows of
+12. **`rows=<N>`** (default: every row): index only the first `N` rows of
     `data`, for a prefix of a larger file. `cluster_ids` must hold exactly `N`
     assignments.
+
+Points within each cluster are stored in centroid-distance order, with point
+IDs breaking equal-distance ties.
 
 The streaming path trades DRAM for disk: it reorders every vector into a
 scratch directory first, so it needs **free disk equal to the dataset size**,
@@ -82,7 +82,7 @@ released once the build finishes; uint8 input stays uint8 there.
 data file. The space is checked up front, so an
 undersized volume fails immediately rather than hours in.
 
-The build prints the metric, quantization mode, order mode and build mode it
+The build prints the metric, quantization mode and build mode it
 resolved, so a run's log records what it actually did.
 
 ---

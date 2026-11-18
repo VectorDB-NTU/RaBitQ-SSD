@@ -1011,23 +1011,6 @@ namespace rabitqlib::ivf_ssd
         std::free(ex_data_tmp);
     }
 
-    // Full-DRAM path: fetch the i-th point from the in-memory dataset by global
-    // pid and store the same global pids into cp.ids(). Forwards to the shared
-    // core with batch_parallel off, since construct_invlist already
-    // parallelises over clusters.
-    inline void IvfSsdIndex::quantize_and_write_clusterssd(
-        ivf::Cluster &cp, const std::vector<PID> &ids, const float *data,
-        const float *cur_centroid, float *rotated_centroid,
-        const quant::RabitqConfig &config, size_t cluster_offset)
-    {
-        const PID *ids_ptr = ids.data();
-        quantize_and_write_cluster_core(
-            cp, ids_ptr, ids.size(),
-            [&](size_t i) { return data + (static_cast<size_t>(ids_ptr[i]) * dim_); },
-            cur_centroid, rotated_centroid, config, cluster_offset,
-            /*batch_parallel=*/false);
-    }
-
     template <class FetchRow>
     inline std::vector<size_t>
     IvfSsdIndex::compute_centroid_order(
@@ -1086,36 +1069,36 @@ namespace rabitqlib::ivf_ssd
         return order;
     }
 
-    inline void IvfSsdIndex::quantize_and_write_ordered_clusterssd(
+    // Full-DRAM path: order points by centroid distance, fetch by global pid,
+    // and pass those pids to the shared core. The outer build loop parallelizes
+    // over clusters, so batch_parallel is false.
+    inline void IvfSsdIndex::quantize_and_write_clusterssd(
         ivf::Cluster &cp, const std::vector<PID> &ids, const float *data,
         const float *cur_centroid, float *rotated_centroid,
         const quant::RabitqConfig &config, size_t cluster_offset)
     {
-        if (ids.empty())
-        {
-            quantize_and_write_clusterssd(cp, ids, data, cur_centroid,
-                                          rotated_centroid, config,
-                                          cluster_offset);
-            return;
-        }
-
-        // The same permutation the streaming build computes, from the same
-        // helper -- the two paths are contractually bit-identical, so the rule
-        // must live in exactly one place.
-        const std::vector<size_t> order = compute_centroid_order(
-            ids.data(), ids.size(),
-            [&](size_t i) { return data + (static_cast<size_t>(ids[i]) * dim_); },
-            cur_centroid);
-
         std::vector<PID> ordered_ids;
-        ordered_ids.reserve(ids.size());
-        for (size_t idx : order)
+        const PID *ids_ptr = ids.data();
+        if (!ids.empty())
         {
-            ordered_ids.push_back(ids[idx]);
+            const std::vector<size_t> order = compute_centroid_order(
+                ids.data(), ids.size(),
+                [&](size_t i) { return data + (static_cast<size_t>(ids[i]) * dim_); },
+                cur_centroid);
+
+            ordered_ids.reserve(ids.size());
+            for (size_t idx : order)
+            {
+                ordered_ids.push_back(ids[idx]);
+            }
+            ids_ptr = ordered_ids.data();
         }
 
-        quantize_and_write_clusterssd(cp, ordered_ids, data, cur_centroid,
-                                      rotated_centroid, config, cluster_offset);
+        quantize_and_write_cluster_core(
+            cp, ids_ptr, ids.size(),
+            [&](size_t i) { return data + (static_cast<size_t>(ids_ptr[i]) * dim_); },
+            cur_centroid, rotated_centroid, config, cluster_offset,
+            /*batch_parallel=*/false);
     }
 
     // Build the coarse-quantizer-independent inverted list: quantize every
@@ -1126,7 +1109,7 @@ namespace rabitqlib::ivf_ssd
     // persist them for the coarse build to reuse.
     inline void IvfSsdIndex::construct_invlist(
         const float *data, const float *centroids, const CID *assignments,
-        bool faster, ClusterOrderMode order_mode)
+        bool faster)
     {
         LOG(INFO) << "Constructing inverted list (split-storage base)...";
         check_ssd_layout_searchable();
@@ -1178,18 +1161,9 @@ namespace rabitqlib::ivf_ssd
             ivf::Cluster &cp = cluster_lst_[i];
             const size_t cluster_offset = cluster_first_page_[i] * SECTOR_LEN;
 
-            if (order_mode == ClusterOrderMode::OrderedByCentroidDistance)
-            {
-                quantize_and_write_ordered_clusterssd(
-                    cp, id_lists[i], data, cur_centroid, cur_rotated_c,
-                    config, cluster_offset);
-            }
-            else
-            {
-                quantize_and_write_clusterssd(cp, id_lists[i], data,
-                                              cur_centroid, cur_rotated_c,
-                                              config, cluster_offset);
-            }
+            quantize_and_write_clusterssd(
+                cp, id_lists[i], data, cur_centroid, cur_rotated_c,
+                config, cluster_offset);
         }
         // The coarse quantizer is not populated here: it is built separately
         // from rotated_centroids_ by build_coarse_quantizer.
@@ -1213,7 +1187,7 @@ namespace rabitqlib::ivf_ssd
     // -----------------------------------------------------------------------
     inline void IvfSsdIndex::construct_invlist_streaming(
         const std::string &data_file, const float *centroids,
-        const CID *assignments, bool faster, ClusterOrderMode order_mode,
+        const CID *assignments, bool faster,
         size_t mem_budget_bytes, size_t prefix_rows)
     {
         namespace fs = std::filesystem;
@@ -1717,9 +1691,9 @@ namespace rabitqlib::ivf_ssd
 
             if (!file_is_big[f])
             {
-                // Small group: build per-cluster local row/pid lists in slot
-                // (that is, increasing-pid) order, then quantize the clusters
-                // in parallel.
+                // Small group: gather per-cluster local row/pid lists in
+                // increasing-pid order, then sort by centroid distance and
+                // quantize the clusters in parallel.
                 const auto &clusters = file_clusters[f];
                 std::unordered_map<uint32_t, uint32_t> cpos;
                 cpos.reserve(clusters.size() * 2);
@@ -1747,40 +1721,28 @@ namespace rabitqlib::ivf_ssd
                     const size_t coff = cluster_first_page_[c] * SECTOR_LEN;
                     const auto &rows = loc_rows[k];
                     const size_t nc = rows.size();
-                    if (order_mode ==
-                        ClusterOrderMode::OrderedByCentroidDistance)
+                    auto order = compute_centroid_order(
+                        loc_pids[k].data(), nc,
+                        [&](size_t i) { return gbuf + rows[i] * dim_; },
+                        cur_centroid);
+                    std::vector<PID> opids(nc);
+                    std::vector<uint32_t> orows(nc);
+                    for (size_t j = 0; j < nc; ++j)
                     {
-                        auto order = compute_centroid_order(
-                            loc_pids[k].data(), nc,
-                            [&](size_t i) { return gbuf + rows[i] * dim_; },
-                            cur_centroid);
-                        std::vector<PID> opids(nc);
-                        std::vector<uint32_t> orows(nc);
-                        for (size_t j = 0; j < nc; ++j)
-                        {
-                            opids[j] = loc_pids[k][order[j]];
-                            orows[j] = rows[order[j]];
-                        }
-                        quantize_and_write_cluster_core(
-                            cp, opids.data(), nc,
-                            [&](size_t i) { return gbuf + orows[i] * dim_; },
-                            cur_centroid, rc, config, coff,
-                            /*batch_parallel=*/false);
+                        opids[j] = loc_pids[k][order[j]];
+                        orows[j] = rows[order[j]];
                     }
-                    else
-                    {
-                        quantize_and_write_cluster_core(
-                            cp, loc_pids[k].data(), nc,
-                            [&](size_t i) { return gbuf + rows[i] * dim_; },
-                            cur_centroid, rc, config, coff,
-                            /*batch_parallel=*/false);
-                    }
+                    quantize_and_write_cluster_core(
+                        cp, opids.data(), nc,
+                        [&](size_t i) { return gbuf + orows[i] * dim_; },
+                        cur_centroid, rc, config, coff,
+                        /*batch_parallel=*/false);
                 }
             }
             else
             {
-                // Big cluster: the solo file is already in increasing-pid
-                // order and its rows are 0..n-1. Quantize with intra-cluster
+                // Big cluster: the solo file has increasing-pid rows 0..n-1.
+                // Sort by centroid distance, then quantize with intra-cluster
                 // (batch) parallelism, one cluster at a time, so that only one
                 // large buffer is resident.
                 const uint32_t c = file_clusters[f][0];
@@ -1791,31 +1753,21 @@ namespace rabitqlib::ivf_ssd
                 std::vector<PID> pids(n);
                 for (size_t r = 0; r < n; ++r) pids[r] = meta[r].pid;
 
-                if (order_mode == ClusterOrderMode::OrderedByCentroidDistance)
+                auto order = compute_centroid_order(
+                    pids.data(), n,
+                    [&](size_t i) { return gbuf + i * dim_; }, cur_centroid);
+                std::vector<PID> opids(n);
+                std::vector<size_t> orows(n);
+                for (size_t j = 0; j < n; ++j)
                 {
-                    auto order = compute_centroid_order(
-                        pids.data(), n,
-                        [&](size_t i) { return gbuf + i * dim_; }, cur_centroid);
-                    std::vector<PID> opids(n);
-                    std::vector<size_t> orows(n);
-                    for (size_t j = 0; j < n; ++j)
-                    {
-                        opids[j] = pids[order[j]];
-                        orows[j] = order[j];
-                    }
-                    quantize_and_write_cluster_core(
-                        cp, opids.data(), n,
-                        [&](size_t i) { return gbuf + orows[i] * dim_; },
-                        cur_centroid, rc, config, coff,
-                        /*batch_parallel=*/true);
+                    opids[j] = pids[order[j]];
+                    orows[j] = order[j];
                 }
-                else
-                {
-                    quantize_and_write_cluster_core(
-                        cp, pids.data(), n,
-                        [&](size_t i) { return gbuf + i * dim_; }, cur_centroid,
-                        rc, config, coff, /*batch_parallel=*/true);
-                }
+                quantize_and_write_cluster_core(
+                    cp, opids.data(), n,
+                    [&](size_t i) { return gbuf + orows[i] * dim_; },
+                    cur_centroid, rc, config, coff,
+                    /*batch_parallel=*/true);
             }
 
             std::free(gbuf);

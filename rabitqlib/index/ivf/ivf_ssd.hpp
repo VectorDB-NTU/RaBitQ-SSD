@@ -578,12 +578,6 @@ namespace rabitqlib::ivf_ssd
                                            float *rotated_centroid,
                                            const quant::RabitqConfig &config,
                                            size_t cluster_offset);
-        void quantize_and_write_ordered_clusterssd(
-            ivf::Cluster &cp, const std::vector<PID> &ids,
-            const float *data, const float *cur_centroid,
-            float *rotated_centroid, const quant::RabitqConfig &config,
-            size_t cluster_offset);
-
         // Shared quantize+write core for one cluster. Decouples "the global pid
         // stored into cp.ids()" (pids) from "where the i-th point's dim_-length
         // source vector lives" (fetch_row(i)): the full-DRAM build fetches
@@ -600,11 +594,9 @@ namespace rabitqlib::ivf_ssd
             size_t cluster_offset, bool batch_parallel);
 
         // Stable order of a cluster's points by centroid distance (ascending),
-        // tie-broken by pid -- the OrderedByCentroidDistance permutation,
-        // computed via fetch_row so it works for both build paths. Both call
-        // this: the full-DRAM build fetches from the in-RAM dataset, the
-        // streaming build from its reorder scratch. One rule, so the two builds
-        // cannot drift out of their bit-identical contract.
+        // tie-broken by pid. The full-DRAM build fetches from the in-RAM
+        // dataset; the streaming build fetches from its reorder scratch.
+        // Both build paths use this ordering before quantization.
         template <class FetchRow>
         std::vector<size_t> compute_centroid_order(
             const PID *pids, size_t num_points, FetchRow fetch_row,
@@ -712,12 +704,6 @@ namespace rabitqlib::ivf_ssd
             buffer::SearchBuffer<float> &knns, SearchStats *stats);
 
     public:
-        enum class ClusterOrderMode : std::uint8_t
-        {
-            Unordered = 0,
-            OrderedByCentroidDistance = 1,
-        };
-
         explicit IvfSsdIndex() = default;
         // num: number of indexed points, from 0 through the PID range.
         // dim: positive input width supported by the selected rotator.
@@ -746,13 +732,12 @@ namespace rabitqlib::ivf_ssd
         // build_coarse_quantizer + save_coarse once per coarse quantizer.
         // Query: load_base then load_coarse.
 
-        // Inverted-list (base) build. Quantizes the data, writes <base>.ssd,
-        // and caches the rotated centroids (rotated_centroids_) for
-        // save_base(). Builds no coarse quantizer; the centroids are only
-        // stored, not indexed.
+        // Inverted-list (base) build. Orders each cluster by centroid distance,
+        // quantizes the data, writes <base>.ssd, and caches the rotated
+        // centroids (rotated_centroids_) for save_base(). Builds no coarse
+        // quantizer; the centroids are only stored, not indexed.
         void construct_invlist(const float *data, const float *centroids,
-                               const CID *assignments, bool faster,
-                               ClusterOrderMode order_mode);
+                               const CID *assignments, bool faster);
         // Memory-budgeted streaming variant of construct_invlist. Produces the
         // same base index + SSD file as construct_invlist (byte-for-byte when
         // RABITQ_ROTATOR_SEED pins the shared rotation), but never
@@ -768,7 +753,6 @@ namespace rabitqlib::ivf_ssd
         void construct_invlist_streaming(const std::string &data_file,
                                          const float *centroids,
                                          const CID *assignments, bool faster,
-                                         ClusterOrderMode order_mode,
                                          size_t mem_budget_bytes,
                                          size_t prefix_rows = 0);
         // Write the coarse-quantizer-independent base index to <base>.

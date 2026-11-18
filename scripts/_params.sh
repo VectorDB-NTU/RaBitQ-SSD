@@ -1,7 +1,7 @@
 # _params.sh — derive the index parameters from the dataset itself.
 # Sourced by the three stage runners; not executable on its own.
 #
-#   derive_params <train file>   sets N D C MEMDIM METRIC METRIC_TAG B ORDER STORE
+#   derive_params <train file>   sets N D C MEMDIM METRIC METRIC_TAG B STORE
 #                                STORE_TAG ROWS_OPT N_TAG BIN_SUBDIR
 #   resolve_vectors <dir> <stem> prints <dir>/<stem>.fbin, .u8bin or .bvecs
 #
@@ -29,9 +29,6 @@
 #   B       total bits per dim    default 9 = 1 sign bit + 8 extra-precision
 #                                 bits. Fewer bits shrink the index and lower
 #                                 recall at a given nprobe        override: B_ENV
-#   ORDER   ordered | unordered   default ordered: points within a cluster are
-#                                 stored in centroid-distance order
-#                                                              override: ORDER_ENV
 #   STORE   exbits | raw          what the SSD records hold. exbits (default):
 #                                 the rest of the 1-bit code plus (B-1)-bit
 #                                 extra-precision codes. raw: the vectors as
@@ -86,7 +83,6 @@ derive_params() {
     MEMDIM=${MEMDIM_ENV:-$(( (D + 63) / 64 * 64 ))}
     METRIC=${METRIC_ENV:-l2}
     B=${B_ENV:-9}
-    ORDER=${ORDER_ENV:-ordered}
     STORE=${STORE_ENV:-exbits}
     case ${STORE} in
         exbits) STORE_TAG=B${B} ;;
@@ -106,10 +102,6 @@ derive_params() {
     if [[ ${METRIC} != l2 ]]; then
         METRIC_TAG=_${METRIC}
     fi
-    case ${ORDER} in
-        ordered|unordered) ;;
-        *) echo "[FATAL] ORDER_ENV must be ordered or unordered, got '${ORDER}'" >&2; return 1 ;;
-    esac
     if [[ ! ${B} =~ ^[0-9]+$ ]] || (( B < 2 || B > 9 )); then
         echo "[FATAL] B_ENV must be an integer in [2,9] (1 sign bit + B-1 extra), got '${B}'" >&2
         return 1

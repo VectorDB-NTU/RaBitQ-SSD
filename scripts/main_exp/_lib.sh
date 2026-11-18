@@ -97,7 +97,7 @@ qd_for_T() {
 
 OUTDIR=${REPO}/results/main_exp/${CFG_TAG}${OUT_TAG_SUFFIX:-}
 # The merge joins the cells of ONE configuration -- every topk x threads cell
-# that shares an index (B, order, memdim, metric), a coarse quantizer with its
+# that shares an index (B, memdim, metric), a coarse quantizer with its
 # search config, and drain_alpha. So it is keyed by exactly the same tag as the
 # per-cell directory: assemble() truncates its output, so a key that dropped any
 # of those would let a second arm silently erase the first one's merged CSV.

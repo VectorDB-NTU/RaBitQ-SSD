@@ -64,7 +64,7 @@ def parse_index_dir(idx_dir):
     raw = re.search(r"_cpu_raw_", name) is not None
     memdim = g(r"memdim(\d+)")
     metric = g(r"_(l2|ip|cosine)_")
-    order = g(r"_(ordered|unordered)")
+    order = g(r"_(ordered)(?:_|$)")
 
     inv_log = _read(os.path.join(idx_dir, "build_invlist.log"))
     # Sorted so a directory holding several coarse arms picks the same one

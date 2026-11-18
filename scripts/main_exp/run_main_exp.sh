@@ -42,13 +42,13 @@ TRAIN_FILE=$(resolve_vectors "${DDIR}" train) || exit 1
 QUERY_FILE=$(resolve_vectors "${DDIR}" test) || exit 1
 derive_params "${TRAIN_FILE}" || exit 1
 IDXROOT=${INDEX_ROOT:-}
-IDX_NAME=idx_C${C}${N_TAG}_cpu_${STORE_TAG}_memdim${MEMDIM}_${METRIC}_${ORDER}
+IDX_NAME=idx_C${C}${N_TAG}_cpu_${STORE_TAG}_memdim${MEMDIM}_${METRIC}_ordered
 IDXDIR=${IDX_DIR_ENV:-${IDXROOT}/${DATASET}/${IDX_NAME}}
-TAG=${IDX_TAG_ENV:-ss_${DATASET}_C${C}${N_TAG}_cpu_${STORE_TAG}_memdim${MEMDIM}_${METRIC}_${ORDER}}
+TAG=${IDX_TAG_ENV:-ss_${DATASET}_C${C}${N_TAG}_cpu_${STORE_TAG}_memdim${MEMDIM}_${METRIC}_ordered}
 
 # Keep the metric out of the tag when it is the default L2, so an l2 run and an
-# ip run over the same dataset land in separate result trees. B, the SSD store
-# and the cluster order follow the same rule: each selects a different index,
+# ip run over the same dataset land in separate result trees. B and the SSD
+# store follow the same rule: each selects a different index,
 # so a non-default value must not reuse the cells of the default run.
 CFG_METRIC=""
 [[ ${METRIC} != l2 ]] && CFG_METRIC=_${METRIC}
@@ -58,8 +58,6 @@ if [[ ${STORE} == raw ]]; then
 elif [[ ${B} != 9 ]]; then
     CFG_B=_B${B}
 fi
-CFG_ORDER=""
-[[ ${ORDER} != ordered ]] && CFG_ORDER=_${ORDER}
 # A non-default IRQ inner size names its own coarse file at build time
 # (_build_lib.sh); _lib.sh loads the file by the same suffix.
 INNER_SUFFIX=""
@@ -74,7 +72,7 @@ else
 fi
 # Set here rather than in _lib.sh because the tag below names it.
 DRAIN_ALPHA=${DRAIN_ALPHA_ENV:-0.4}
-CFG_TAG=${DATASET}_C${C}${N_TAG}${CFG_B}_memdim${MEMDIM}${CFG_METRIC}${CFG_ORDER}_${CFG_COARSE}_drainA${DRAIN_ALPHA}
+CFG_TAG=${DATASET}_C${C}${N_TAG}${CFG_B}_memdim${MEMDIM}${CFG_METRIC}_${CFG_COARSE}_drainA${DRAIN_ALPHA}
 
 source "${SCRIPT_DIR}/_lib.sh"
 run_grid
